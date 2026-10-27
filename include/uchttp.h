@@ -18,6 +18,9 @@
 #ifndef UCHTTP_MAX_ROUTES
 #  define UCHTTP_MAX_ROUTES   16
 #endif
+#ifndef UCHTTP_MAX_PATH_PARAMS
+#  define UCHTTP_MAX_PATH_PARAMS 8
+#endif
 #ifndef UCHTTP_RX_BUFFER_SIZE
 #  define UCHTTP_RX_BUFFER_SIZE 1024
 #endif
@@ -55,7 +58,7 @@ protected:
 // HttpMethod
 // ---------------------------------------------------------------------------
 
-enum class HttpMethod : uint8_t { GET, POST, PUT, DELETE, PATCH, HEAD, UNKNOWN };
+enum class HttpMethod : uint8_t { GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, UNKNOWN };
 
 // Defined in uchttp.cpp
 HttpMethod       llhttp_method_to_uchttp(uint8_t m) noexcept;
@@ -71,19 +74,144 @@ struct HttpHeader {
 };
 
 // ---------------------------------------------------------------------------
+// QueryString  – zero-alloc, zero-copy iterator over "key=value&key2=value2"
+//
+// Holds a string_view into the RX buffer (the part after '?' in the URL) and
+// lazily iterates over key/value pairs. No heap, no owning storage.
+// ---------------------------------------------------------------------------
+
+class QueryString {
+public:
+    struct Pair {
+        std::string_view key;
+        std::string_view value;
+    };
+
+    constexpr QueryString() noexcept = default;
+    constexpr explicit QueryString(std::string_view raw) noexcept : raw_(raw) {}
+
+    // Forward iterator over key/value pairs ---------------------------------
+    class iterator {
+    public:
+        using value_type        = Pair;
+        using difference_type   = std::ptrdiff_t;
+        using iterator_category = std::forward_iterator_tag;
+
+        constexpr iterator() noexcept = default;
+        constexpr explicit iterator(std::string_view rest) noexcept
+            : rest_(rest) { advance(); }
+
+        constexpr const Pair& operator*()  const noexcept { return current_; }
+        constexpr const Pair* operator->() const noexcept { return &current_; }
+
+        constexpr iterator& operator++() noexcept { advance(); return *this; }
+
+        constexpr bool operator==(const iterator& o) const noexcept {
+            return at_end_ == o.at_end_ &&
+                   (at_end_ || rest_.data() == o.rest_.data());
+        }
+        constexpr bool operator!=(const iterator& o) const noexcept {
+            return !(*this == o);
+        }
+
+    private:
+        constexpr void advance() noexcept {
+            if (rest_.empty()) { at_end_ = true; return; }
+            at_end_ = false;
+
+            // take one segment up to '&'
+            std::string_view seg;
+            auto amp = rest_.find('&');
+            if (amp == std::string_view::npos) {
+                seg  = rest_;
+                rest_ = {};
+            } else {
+                seg  = rest_.substr(0, amp);
+                rest_ = rest_.substr(amp + 1);
+            }
+
+            // split segment on first '='
+            auto eq = seg.find('=');
+            if (eq == std::string_view::npos) {
+                current_ = { seg, {} };
+            } else {
+                current_ = { seg.substr(0, eq), seg.substr(eq + 1) };
+            }
+        }
+
+        std::string_view rest_{};
+        Pair             current_{};
+        bool             at_end_ { true };
+    };
+
+    constexpr iterator begin() const noexcept { return iterator(raw_); }
+    constexpr iterator end()   const noexcept { return iterator(); }
+
+    constexpr bool             empty() const noexcept { return raw_.empty(); }
+    constexpr std::string_view raw()   const noexcept { return raw_; }
+
+    // Returns value for the first matching key, or {} if absent.
+    constexpr std::string_view get(std::string_view key) const noexcept {
+        for (auto it = begin(); it != end(); ++it) {
+            if (it->key == key) return it->value;
+        }
+        return {};
+    }
+
+    // True if the key is present (even with an empty value, e.g. "?flag").
+    constexpr bool has(std::string_view key) const noexcept {
+        for (auto it = begin(); it != end(); ++it) {
+            if (it->key == key) return true;
+        }
+        return false;
+    }
+
+private:
+    std::string_view raw_{};
+};
+
+// ---------------------------------------------------------------------------
+// PathParam  – one extracted dynamic URL segment, e.g. {id} -> "42"
+// ---------------------------------------------------------------------------
+
+struct PathParam {
+    std::string_view name;   // template name, e.g. "id"
+    std::string_view value;  // zero-copy view into RX buffer, e.g. "42"
+};
+
+// ---------------------------------------------------------------------------
 // HttpRequest
 // ---------------------------------------------------------------------------
 
 struct HttpRequest {
     HttpMethod       method { HttpMethod::UNKNOWN };
-    std::string_view path;
+    std::string_view path;       // path only, query string stripped
+    std::string_view raw_query;  // part after '?', without the '?'
     std::string_view body;
 
     uint8_t    header_count { 0 };
     HttpHeader headers[UCHTTP_MAX_HEADERS];
 
+    uint8_t    param_count { 0 };
+    PathParam  path_params[UCHTTP_MAX_PATH_PARAMS];
+
     std::string_view get_header(std::string_view name) const noexcept;
-    void             reset() noexcept;
+
+    // Query string accessors -------------------------------------------------
+    QueryString      query() const noexcept { return QueryString(raw_query); }
+    std::string_view query_param(std::string_view key) const noexcept {
+        return QueryString(raw_query).get(key);
+    }
+
+    // Path parameter accessor ------------------------------------------------
+    std::string_view path_param(std::string_view name) const noexcept {
+        for (uint8_t i = 0; i < param_count; ++i) {
+            if (path_params[i].name == name) return path_params[i].value;
+        }
+        return {};
+    }
+
+    void reset() noexcept;
 };
 
 // ---------------------------------------------------------------------------
@@ -201,6 +329,7 @@ public:
         return true;
     }
 
+    // Exact-match lookup (kept for backward compatibility / simple cases).
     const Route* find(HttpMethod method, std::string_view path) const noexcept {
         for (size_t i = 0; i < count_; ++i) {
             if (routes_[i].method == method && routes_[i].path == path)
@@ -209,9 +338,94 @@ public:
         return nullptr;
     }
 
+    // Pattern-aware lookup. On a match of a templated route (e.g.
+    // "/api/sensors/{id}") the extracted parameters are written into `req`.
+    // Static segments must match literally; "{name}" segments match any single
+    // non-empty segment and capture its value as path param "name".
+    const Route* find(HttpMethod method, std::string_view path,
+                      HttpRequest& req) const noexcept {
+        // First pass: prefer an exact literal match (fast path, no capture).
+        for (size_t i = 0; i < count_; ++i) {
+            if (routes_[i].method == method && routes_[i].path == path)
+                return &routes_[i];
+        }
+        // Second pass: templated patterns.
+        for (size_t i = 0; i < count_; ++i) {
+            if (routes_[i].method != method) continue;
+            if (!is_pattern(routes_[i].path)) continue;
+            req.param_count = 0;
+            if (match_pattern(routes_[i].path, path, req))
+                return &routes_[i];
+        }
+        req.param_count = 0;
+        return nullptr;
+    }
+
+    // Returns true if any route (any method) matches the path literally or by
+    // pattern. Used to distinguish 404 (no such resource) from 405 (wrong
+    // method) and to build the Allow header for OPTIONS.
+    bool path_exists(std::string_view path) const noexcept {
+        HttpRequest scratch;
+        for (size_t i = 0; i < count_; ++i) {
+            if (routes_[i].path == path) return true;
+            if (is_pattern(routes_[i].path)) {
+                scratch.param_count = 0;
+                if (match_pattern(routes_[i].path, path, scratch)) return true;
+            }
+        }
+        return false;
+    }
+
     size_t size() const noexcept { return count_; }
 
+    const Route& operator[](size_t i) const noexcept { return routes_[i]; }
+
 private:
+    // A pattern contains at least one "{...}" segment.
+    static bool is_pattern(std::string_view p) noexcept {
+        return p.find('{') != std::string_view::npos;
+    }
+
+    // Split helper: returns the segment before the next '/' and advances `s`
+    // past it. Leading '/' is skipped by the caller.
+    static std::string_view next_segment(std::string_view& s) noexcept {
+        auto slash = s.find('/');
+        if (slash == std::string_view::npos) {
+            std::string_view seg = s;
+            s = {};
+            return seg;
+        }
+        std::string_view seg = s.substr(0, slash);
+        s = s.substr(slash + 1);
+        return seg;
+    }
+
+    // Segment-by-segment match of `pattern` against `path`, capturing any
+    // "{name}" segments into req.path_params. No allocation.
+    static bool match_pattern(std::string_view pattern, std::string_view path,
+                              HttpRequest& req) noexcept {
+        // Both must start with '/' to be comparable segment-wise.
+        if (!pattern.empty() && pattern.front() == '/') pattern.remove_prefix(1);
+        if (!path.empty()    && path.front()    == '/') path.remove_prefix(1);
+
+        while (!pattern.empty() || !path.empty()) {
+            if (pattern.empty() || path.empty()) return false;  // length mismatch
+
+            std::string_view pseg = next_segment(pattern);
+            std::string_view vseg = next_segment(path);
+
+            if (pseg.size() >= 2 && pseg.front() == '{' && pseg.back() == '}') {
+                if (vseg.empty()) return false;  // dynamic segment must be non-empty
+                if (req.param_count >= UCHTTP_MAX_PATH_PARAMS) return false;
+                std::string_view name = pseg.substr(1, pseg.size() - 2);
+                req.path_params[req.param_count++] = { name, vseg };
+            } else if (pseg != vseg) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     Route  routes_[MaxRoutes] {};
     size_t count_ { 0 };
 };
@@ -299,10 +513,14 @@ public:
         response_.reset();
 
         const Route* route = routes.find(state_.request.method,
-                                          state_.request.path);
+                                          state_.request.path,
+                                          state_.request);
         if (route && route->handler) {
             route->handler(state_.request, response_);
             (void)response_.send(socket_);
+        } else if (routes.path_exists(state_.request.path)) {
+            // Path exists but not for this method -> 405 Method Not Allowed.
+            send_error(405, "Method Not Allowed");
         } else {
             send_error(404, "Not Found");
         }
@@ -355,9 +573,13 @@ public:
         return routes_.add(method, path, handler);
     }
 
-    bool get (std::string_view path, HandlerFn h) noexcept { return add_route(HttpMethod::GET,  path, h); }
-    bool post(std::string_view path, HandlerFn h) noexcept { return add_route(HttpMethod::POST, path, h); }
-    bool put (std::string_view path, HandlerFn h) noexcept { return add_route(HttpMethod::PUT,  path, h); }
+    bool get (std::string_view path, HandlerFn h) noexcept { return add_route(HttpMethod::GET,     path, h); }
+    bool post(std::string_view path, HandlerFn h) noexcept { return add_route(HttpMethod::POST,    path, h); }
+    bool put (std::string_view path, HandlerFn h) noexcept { return add_route(HttpMethod::PUT,     path, h); }
+    bool del (std::string_view path, HandlerFn h) noexcept { return add_route(HttpMethod::DELETE,  path, h); }
+    bool patch  (std::string_view path, HandlerFn h) noexcept { return add_route(HttpMethod::PATCH,   path, h); }
+    bool head   (std::string_view path, HandlerFn h) noexcept { return add_route(HttpMethod::HEAD,    path, h); }
+    bool options(std::string_view path, HandlerFn h) noexcept { return add_route(HttpMethod::OPTIONS, path, h); }
 
     template <typename Acceptor>
         requires AcceptorConcept<Acceptor, Socket>

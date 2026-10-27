@@ -365,13 +365,13 @@ TEST(HttpConnectionTest, PUT_ItemParsedCorrectly) {
     EXPECT_EQ(g_record.body, json);
 }
 
-TEST(HttpConnectionTest, PUT_WrongMethodOnGetRoute_Returns404) {
-    // /hello only has GET registered
+TEST(HttpConnectionTest, PUT_WrongMethodOnGetRoute_Returns405) {
+    // /hello only has GET registered -> path exists, method not allowed.
     const std::string raw =
         "PUT /hello HTTP/1.1\r\nHost: localhost\r\n"
         "Content-Length: 0\r\n\r\n";
     std::string tx = process_request(raw, kRoutes);
-    EXPECT_EQ(parse_status_code(tx), 404);
+    EXPECT_EQ(parse_status_code(tx), 405);
 }
 
 // ---------------------------------------------------------------------------
@@ -519,4 +519,371 @@ TEST(HttpResponseTest, LargeBody) {
     MockSocket sock;
     res.send(sock, 200, big_body, "text/plain");
     EXPECT_EQ(sock.tx_body(), big_body);
+}
+
+// ===========================================================================
+// QueryString – standalone unit tests (no socket needed)
+// ===========================================================================
+
+TEST(QueryStringTest, EmptyIsEmpty) {
+    QueryString qs;
+    EXPECT_TRUE(qs.empty());
+    EXPECT_EQ(qs.begin(), qs.end());
+    EXPECT_EQ(qs.get("x"), "");
+    EXPECT_FALSE(qs.has("x"));
+}
+
+TEST(QueryStringTest, SinglePair) {
+    QueryString qs("filter=active");
+    EXPECT_FALSE(qs.empty());
+    EXPECT_EQ(qs.get("filter"), "active");
+    EXPECT_TRUE(qs.has("filter"));
+    EXPECT_FALSE(qs.has("missing"));
+}
+
+TEST(QueryStringTest, MultiplePairs) {
+    QueryString qs("filter=active&limit=10&sort=desc");
+    EXPECT_EQ(qs.get("filter"), "active");
+    EXPECT_EQ(qs.get("limit"),  "10");
+    EXPECT_EQ(qs.get("sort"),   "desc");
+    EXPECT_EQ(qs.get("absent"), "");
+}
+
+TEST(QueryStringTest, KeyWithoutValue) {
+    QueryString qs("flag&limit=5");
+    EXPECT_TRUE(qs.has("flag"));
+    EXPECT_EQ(qs.get("flag"), "");
+    EXPECT_EQ(qs.get("limit"), "5");
+}
+
+TEST(QueryStringTest, EmptyValue) {
+    QueryString qs("key=");
+    EXPECT_TRUE(qs.has("key"));
+    EXPECT_EQ(qs.get("key"), "");
+}
+
+TEST(QueryStringTest, IterationOrder) {
+    QueryString qs("a=1&b=2&c=3");
+    std::string collected;
+    for (auto p : qs) {
+        collected += std::string(p.key);
+        collected += "=";
+        collected += std::string(p.value);
+        collected += ";";
+    }
+    EXPECT_EQ(collected, "a=1;b=2;c=3;");
+}
+
+TEST(QueryStringTest, FirstMatchWins) {
+    QueryString qs("x=1&x=2");
+    EXPECT_EQ(qs.get("x"), "1");
+}
+
+// ===========================================================================
+// Query string parsing through the full request pipeline
+// ===========================================================================
+
+TEST(HttpConnectionTest, URL_PathStrippedOfQuery) {
+    RouteTable<8> rt;
+    static std::string captured_path;
+    static std::string captured_query;
+    rt.add(HttpMethod::GET, "/search", [](const HttpRequest& req, HttpResponse& res) {
+        captured_path  = std::string(req.path);
+        captured_query = std::string(req.raw_query);
+        res.set_status(200);
+    });
+
+    const std::string raw =
+        "GET /search?q=temp&limit=5 HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt);
+
+    EXPECT_EQ(parse_status_code(tx), 200);
+    EXPECT_EQ(captured_path,  "/search");
+    EXPECT_EQ(captured_query, "q=temp&limit=5");
+}
+
+TEST(HttpConnectionTest, QueryParamAccessor) {
+    RouteTable<8> rt;
+    static std::string q_val;
+    static std::string limit_val;
+    rt.add(HttpMethod::GET, "/search", [](const HttpRequest& req, HttpResponse& res) {
+        q_val     = std::string(req.query_param("q"));
+        limit_val = std::string(req.query_param("limit"));
+        res.set_status(200);
+    });
+
+    const std::string raw =
+        "GET /search?q=temperature&limit=10 HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt);
+
+    EXPECT_EQ(q_val, "temperature");
+    EXPECT_EQ(limit_val, "10");
+}
+
+TEST(HttpConnectionTest, NoQueryString_RawQueryEmpty) {
+    RouteTable<8> rt;
+    static bool query_empty = false;
+    static std::string captured_path;
+    rt.add(HttpMethod::GET, "/plain", [](const HttpRequest& req, HttpResponse& res) {
+        query_empty   = req.query().empty();
+        captured_path = std::string(req.path);
+        res.set_status(200);
+    });
+
+    const std::string raw =
+        "GET /plain HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt);
+
+    EXPECT_TRUE(query_empty);
+    EXPECT_EQ(captured_path, "/plain");
+}
+
+// ===========================================================================
+// Path parameters
+// ===========================================================================
+
+TEST(RouteTableTest, PatternMatchExtractsParam) {
+    RouteTable<8> rt;
+    auto h = [](const HttpRequest&, HttpResponse&) {};
+    rt.add(HttpMethod::GET, "/api/sensors/{id}", h);
+
+    HttpRequest req;
+    req.method = HttpMethod::GET;
+    const Route* r = rt.find(HttpMethod::GET, "/api/sensors/42", req);
+    ASSERT_NE(r, nullptr);
+    EXPECT_EQ(req.param_count, 1);
+    EXPECT_EQ(req.path_param("id"), "42");
+}
+
+TEST(RouteTableTest, MultiplePathParams) {
+    RouteTable<8> rt;
+    auto h = [](const HttpRequest&, HttpResponse&) {};
+    rt.add(HttpMethod::GET, "/api/{group}/items/{item}", h);
+
+    HttpRequest req;
+    const Route* r = rt.find(HttpMethod::GET, "/api/sensors/items/temp", req);
+    ASSERT_NE(r, nullptr);
+    EXPECT_EQ(req.param_count, 2);
+    EXPECT_EQ(req.path_param("group"), "sensors");
+    EXPECT_EQ(req.path_param("item"),  "temp");
+}
+
+TEST(RouteTableTest, ExactMatchPreferredOverPattern) {
+    RouteTable<8> rt;
+    auto h = [](const HttpRequest&, HttpResponse&) {};
+    rt.add(HttpMethod::GET, "/api/sensors/{id}", h);
+    rt.add(HttpMethod::GET, "/api/sensors/all",  h);
+
+    HttpRequest req;
+    const Route* r = rt.find(HttpMethod::GET, "/api/sensors/all", req);
+    ASSERT_NE(r, nullptr);
+    EXPECT_EQ(r->path, "/api/sensors/all");
+    EXPECT_EQ(req.param_count, 0);  // literal match, no capture
+}
+
+TEST(RouteTableTest, PatternLengthMismatchNoMatch) {
+    RouteTable<8> rt;
+    auto h = [](const HttpRequest&, HttpResponse&) {};
+    rt.add(HttpMethod::GET, "/api/sensors/{id}", h);
+
+    HttpRequest req;
+    // too many segments
+    EXPECT_EQ(rt.find(HttpMethod::GET, "/api/sensors/42/extra", req), nullptr);
+    // too few segments
+    EXPECT_EQ(rt.find(HttpMethod::GET, "/api/sensors", req), nullptr);
+}
+
+TEST(RouteTableTest, PathExists) {
+    RouteTable<8> rt;
+    auto h = [](const HttpRequest&, HttpResponse&) {};
+    rt.add(HttpMethod::GET,  "/api/sensors/{id}", h);
+    rt.add(HttpMethod::POST, "/api/config",       h);
+
+    EXPECT_TRUE(rt.path_exists("/api/sensors/7"));
+    EXPECT_TRUE(rt.path_exists("/api/config"));
+    EXPECT_FALSE(rt.path_exists("/nope"));
+}
+
+TEST(HttpConnectionTest, PathParam_FullPipeline) {
+    RouteTable<8> rt;
+    static std::string captured_id;
+    rt.add(HttpMethod::GET, "/api/sensors/{id}", [](const HttpRequest& req, HttpResponse& res) {
+        captured_id = std::string(req.path_param("id"));
+        res.set_status(200);
+        res.set_body("sensor");
+    });
+
+    const std::string raw =
+        "GET /api/sensors/temp42 HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt);
+
+    EXPECT_EQ(parse_status_code(tx), 200);
+    EXPECT_EQ(captured_id, "temp42");
+}
+
+TEST(HttpConnectionTest, PathParam_WithQueryString) {
+    RouteTable<8> rt;
+    static std::string captured_id;
+    static std::string captured_unit;
+    rt.add(HttpMethod::GET, "/api/sensors/{id}", [](const HttpRequest& req, HttpResponse& res) {
+        captured_id   = std::string(req.path_param("id"));
+        captured_unit = std::string(req.query_param("unit"));
+        res.set_status(200);
+    });
+
+    const std::string raw =
+        "GET /api/sensors/5?unit=celsius HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt);
+
+    EXPECT_EQ(captured_id,   "5");
+    EXPECT_EQ(captured_unit, "celsius");
+}
+
+// ===========================================================================
+// HTTP methods: DELETE, PATCH, HEAD, OPTIONS
+// ===========================================================================
+
+TEST(HttpMethodTest, StringRoundTrip) {
+    EXPECT_STREQ(method_string(HttpMethod::DELETE),  "DELETE");
+    EXPECT_STREQ(method_string(HttpMethod::PATCH),   "PATCH");
+    EXPECT_STREQ(method_string(HttpMethod::HEAD),    "HEAD");
+    EXPECT_STREQ(method_string(HttpMethod::OPTIONS), "OPTIONS");
+}
+
+TEST(HttpConnectionTest, DELETE_Dispatched) {
+    RouteTable<8> rt;
+    static HttpMethod seen = HttpMethod::UNKNOWN;
+    static std::string seen_id;
+    rt.add(HttpMethod::DELETE, "/api/items/{id}", [](const HttpRequest& req, HttpResponse& res) {
+        seen    = req.method;
+        seen_id = std::string(req.path_param("id"));
+        res.set_status(204);
+    });
+
+    const std::string raw =
+        "DELETE /api/items/99 HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt);
+
+    EXPECT_EQ(parse_status_code(tx), 204);
+    EXPECT_EQ(seen, HttpMethod::DELETE);
+    EXPECT_EQ(seen_id, "99");
+}
+
+TEST(HttpConnectionTest, OPTIONS_Dispatched) {
+    RouteTable<8> rt;
+    static bool called = false;
+    rt.add(HttpMethod::OPTIONS, "/api/data", [](const HttpRequest& req, HttpResponse& res) {
+        called = (req.method == HttpMethod::OPTIONS);
+        res.set_status(204);
+        res.add_header("Allow", "GET, POST, OPTIONS");
+        res.add_header("Access-Control-Allow-Origin", "*");
+    });
+
+    const std::string raw =
+        "OPTIONS /api/data HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt);
+
+    EXPECT_EQ(parse_status_code(tx), 204);
+    EXPECT_TRUE(called);
+    EXPECT_EQ(header_value(tx, "Access-Control-Allow-Origin"), "*");
+}
+
+TEST(HttpConnectionTest, PATCH_Dispatched) {
+    RouteTable<8> rt;
+    static std::string body;
+    rt.add(HttpMethod::PATCH, "/api/config", [](const HttpRequest& req, HttpResponse& res) {
+        body = std::string(req.body);
+        res.set_status(200);
+    });
+
+    std::string payload = R"({"level":3})";
+    std::string raw =
+        "PATCH /api/config HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Content-Length: " + std::to_string(payload.size()) + "\r\n"
+        "\r\n" + payload;
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt);
+
+    EXPECT_EQ(parse_status_code(tx), 200);
+    EXPECT_EQ(body, payload);
+}
+
+TEST(HttpConnectionTest, HEAD_Dispatched) {
+    RouteTable<8> rt;
+    static HttpMethod seen = HttpMethod::UNKNOWN;
+    rt.add(HttpMethod::HEAD, "/api/status", [](const HttpRequest& req, HttpResponse& res) {
+        seen = req.method;
+        res.set_status(200);
+    });
+
+    const std::string raw =
+        "HEAD /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt);
+
+    EXPECT_EQ(parse_status_code(tx), 200);
+    EXPECT_EQ(seen, HttpMethod::HEAD);
+}
+
+TEST(HttpConnectionTest, WrongMethod_Returns405) {
+    RouteTable<8> rt;
+    auto h = [](const HttpRequest&, HttpResponse& res) { res.set_status(200); };
+    rt.add(HttpMethod::GET, "/api/only-get", h);
+
+    const std::string raw =
+        "DELETE /api/only-get HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt);
+
+    EXPECT_EQ(parse_status_code(tx), 405);
+}
+
+// ===========================================================================
+// HttpServer method-helper registration
+// ===========================================================================
+
+TEST(HttpServerTest, MethodHelpersRegisterRoutes) {
+    HttpServer<MockSocket> server;
+    auto h = [](const HttpRequest&, HttpResponse&) {};
+    EXPECT_TRUE(server.get    ("/a", h));
+    EXPECT_TRUE(server.post   ("/b", h));
+    EXPECT_TRUE(server.put    ("/c", h));
+    EXPECT_TRUE(server.del    ("/d", h));
+    EXPECT_TRUE(server.patch  ("/e", h));
+    EXPECT_TRUE(server.head   ("/f", h));
+    EXPECT_TRUE(server.options("/g", h));
+
+    const auto& rt = server.routes();
+    EXPECT_EQ(rt.size(), 7u);
+    HttpRequest req;
+    EXPECT_NE(rt.find(HttpMethod::DELETE,  "/d", req), nullptr);
+    EXPECT_NE(rt.find(HttpMethod::OPTIONS, "/g", req), nullptr);
 }

@@ -15,6 +15,7 @@ HttpMethod llhttp_method_to_uchttp(uint8_t m) noexcept {
         case HTTP_DELETE: return HttpMethod::DELETE;
         case HTTP_PATCH:  return HttpMethod::PATCH;
         case HTTP_HEAD:   return HttpMethod::HEAD;
+        case HTTP_OPTIONS:return HttpMethod::OPTIONS;
         default:          return HttpMethod::UNKNOWN;
     }
 }
@@ -27,6 +28,7 @@ const char* method_string(HttpMethod m) noexcept {
         case HttpMethod::DELETE: return "DELETE";
         case HttpMethod::PATCH:  return "PATCH";
         case HttpMethod::HEAD:   return "HEAD";
+        case HttpMethod::OPTIONS:return "OPTIONS";
         default:                 return "UNKNOWN";
     }
 }
@@ -45,8 +47,10 @@ std::string_view HttpRequest::get_header(std::string_view name) const noexcept {
 void HttpRequest::reset() noexcept {
     method       = HttpMethod::UNKNOWN;
     path         = {};
+    raw_query    = {};
     body         = {};
     header_count = 0;
+    param_count  = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -204,6 +208,17 @@ static int cb_on_headers_complete(llhttp_t* p) noexcept {
     auto* s = static_cast<ParseState*>(p->data);
     s->commit_header();
     s->request.method = llhttp_method_to_uchttp(llhttp_get_method(p));
+
+    // Split the accumulated URL into path + query string (zero-copy).
+    // The full URL was accumulated contiguously into request.path by cb_on_url.
+    std::string_view url = s->request.path;
+    auto q = url.find('?');
+    if (q != std::string_view::npos) {
+        s->request.path      = url.substr(0, q);
+        s->request.raw_query = url.substr(q + 1);
+    } else {
+        s->request.raw_query = {};
+    }
     return HPE_OK;
 }
 

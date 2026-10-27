@@ -9,6 +9,10 @@
 //   curl http://localhost:8080/api/hello
 //   curl -X POST http://localhost:8080/api/echo -d 'hello world'
 //   curl -X PUT  http://localhost:8080/api/item -d '{"id":1}'
+//   curl http://localhost:8080/api/sensors/42           # path parameter
+//   curl 'http://localhost:8080/api/search?q=temp&limit=5'  # query string
+//   curl -X DELETE http://localhost:8080/api/sensors/42  # DELETE method
+//   curl -X OPTIONS http://localhost:8080/api/data -i    # CORS preflight
 
 #include <cstdio>
 #include <csignal>
@@ -57,6 +61,51 @@ static void handle_put_item(const uchttp::HttpRequest& req,
     res.set_body(R"({"status":"created"})");
 }
 
+// Path parameter demo: GET /api/sensors/{id}
+// The dynamic {id} segment is captured zero-copy from the RX buffer.
+static void handle_get_sensor(const uchttp::HttpRequest& req,
+                              uchttp::HttpResponse& res) {
+    std::string_view id = req.path_param("id");
+    // A real handler would look up the sensor by id; here we just echo it back.
+    static char buf[128];
+    int n = std::snprintf(buf, sizeof(buf),
+                          R"({"sensor":"%.*s","value":23.5})",
+                          static_cast<int>(id.size()), id.data());
+    res.set_status(200);
+    res.set_content_type("application/json");
+    res.set_body(std::string_view(buf, static_cast<size_t>(n)));
+}
+
+// DELETE /api/sensors/{id}
+static void handle_delete_sensor(const uchttp::HttpRequest& /*req*/,
+                                 uchttp::HttpResponse& res) {
+    res.set_status(204);  // No Content
+}
+
+// Query string demo: GET /api/search?q=...&limit=...
+static void handle_search(const uchttp::HttpRequest& req,
+                          uchttp::HttpResponse& res) {
+    std::string_view q     = req.query_param("q");
+    std::string_view limit = req.query_param("limit");
+    static char buf[256];
+    int n = std::snprintf(buf, sizeof(buf),
+                          R"({"query":"%.*s","limit":"%.*s"})",
+                          static_cast<int>(q.size()),     q.data(),
+                          static_cast<int>(limit.size()), limit.data());
+    res.set_status(200);
+    res.set_content_type("application/json");
+    res.set_body(std::string_view(buf, static_cast<size_t>(n)));
+}
+
+// OPTIONS /api/data – CORS preflight (requirement #1: OPTIONS for CORS).
+static void handle_options_data(const uchttp::HttpRequest& /*req*/,
+                                uchttp::HttpResponse& res) {
+    res.set_status(204);
+    res.add_header("Allow", "GET, POST, OPTIONS");
+    res.add_header("Access-Control-Allow-Origin", "*");
+    res.add_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -72,6 +121,12 @@ int main() {
     server.get ("/api/hello", handle_hello);
     server.post("/api/echo",  handle_echo_post);
     server.put ("/api/item",  handle_put_item);
+
+    // Advanced routing (requirement #1):
+    server.get    ("/api/sensors/{id}", handle_get_sensor);     // path parameter
+    server.del    ("/api/sensors/{id}", handle_delete_sensor);  // DELETE method
+    server.get    ("/api/search",       handle_search);         // query string
+    server.options("/api/data",         handle_options_data);   // OPTIONS/CORS
 
     if (!acceptor.start()) {
         std::fprintf(stderr, "Failed to start acceptor on port 8080\n");

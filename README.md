@@ -61,13 +61,16 @@ Zero heap allocations, zero-copy parsing, CRTP-based socket abstraction.
 │   ┌──────────────────────────┐                                       │
 │   │   ParseState             │                                       │
 │   │   ├─ HttpRequest         │                                       │
-│   │   │   ├─ method          │  enum (GET/POST/PUT/…)                │
-│   │   │   ├─ path            │  string_view → RX buf                │
+│   │   ├─ HttpRequest         │                                       │
+│   │   │   ├─ method          │  enum (GET/POST/PUT/DELETE/…)         │
+│   │   │   ├─ path            │  string_view → RX buf (query stripped)│
+│   │   │   ├─ raw_query       │  string_view → RX buf (after '?')     │
+│   │   │   ├─ path_params[]   │  {name,value} views → RX buf          │
 │   │   │   ├─ body            │  string_view → RX buf                │
 │   │   │   └─ headers[]       │  string_view pairs → RX buf          │
 │   │   └─ message_complete    │                                       │
 │   └──────────┬───────────────┘                                       │
-│              │ RouteTable::find(method, path)                        │
+│              │ RouteTable::find(method, path, request)               │
 │              ▼                                                       │
 │   ┌──────────────────────────┐   ┌──────────────────────────┐       │
 │   │   Route handler (fn ptr) │──►│   HttpResponse           │       │
@@ -115,7 +118,68 @@ cmake -B build && cmake --build build
 curl http://localhost:8080/api/hello
 curl -X POST http://localhost:8080/api/echo -d 'hello'
 curl -X PUT  http://localhost:8080/api/item -d '{"id":1}'
+curl http://localhost:8080/api/sensors/42              # path parameter
+curl 'http://localhost:8080/api/search?q=temp&limit=5' # query string
+curl -X DELETE http://localhost:8080/api/sensors/42    # DELETE method
+curl -X OPTIONS http://localhost:8080/api/data -i      # CORS preflight
 ```
+
+## Advanced routing & request parsing
+
+### Path parameters
+
+Register dynamic segments with `{name}` and read them zero-copy from the
+request — no heap allocation, the value is a `string_view` into the RX buffer:
+
+```cpp
+server.get("/api/sensors/{id}", [](const HttpRequest& req, HttpResponse& res) {
+    std::string_view id = req.path_param("id");   // e.g. "42"
+    // ... look up sensor by id ...
+    res.set_status(200);
+});
+```
+
+Literal routes always win over patterns, so `/api/sensors/all` can be
+registered alongside `/api/sensors/{id}`.
+
+### Query string
+
+The query string (everything after `?`) is parsed lazily by an allocation-free
+iterator:
+
+```cpp
+server.get("/api/search", [](const HttpRequest& req, HttpResponse& res) {
+    std::string_view q     = req.query_param("q");      // ?q=temp
+    std::string_view limit = req.query_param("limit");  // &limit=5
+
+    // Or iterate over every pair:
+    for (auto [key, value] : req.query()) { /* ... */ }
+
+    res.set_status(200);
+});
+```
+
+`req.path` always contains the path only; the query string is kept separately
+in `req.raw_query`.
+
+### HTTP methods
+
+Full support for `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD` and `OPTIONS`
+(the last is required for CORS preflight):
+
+```cpp
+server.get    ("/api/data", handler);
+server.post   ("/api/data", handler);
+server.put    ("/api/data", handler);
+server.del    ("/api/data", handler);
+server.patch  ("/api/data", handler);
+server.head   ("/api/data", handler);
+server.options("/api/data", handler);  // CORS preflight
+```
+
+A request to a known path with an unregistered method returns
+`405 Method Not Allowed`; an unknown path returns `404 Not Found`.
+
 
 ## Running tests
 
@@ -138,7 +202,7 @@ include/uchttp.h        Core library (header-only)
 src/linux_socket.h      POSIX LinuxSocket + LinuxAcceptor
 src/linux_server.cpp    Example server on localhost
 tests/mock_socket.h     In-memory socket for unit tests
-tests/test_uchttp.cpp   27 gtest unit tests
+tests/test_uchttp.cpp   51 gtest unit tests
 CMakeLists.txt          Build system
 third_party/llhttp/     llhttp v9.4.3
 ```
