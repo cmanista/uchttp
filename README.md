@@ -107,6 +107,7 @@ Zero heap allocations, zero-copy parsing, CRTP-based socket abstraction.
 | **llhttp** | Battle-tested incremental parser from Node.js (v9.4.3) |
 | **Static routing** | `RouteTable<N>` is a fixed array; size is a compile-time constant |
 | **Handler signature** | `void(const HttpRequest&, HttpResponse&)` — plain function pointer |
+| **Middleware** | Chain of Responsibility; `void(req, res, MiddlewareChain&)` fn ptrs, fixed array |
 | **Portability** | Core library (`uchttp.h`) has no OS or POSIX dependencies |
 
 ## Quick start (Linux)
@@ -180,6 +181,43 @@ server.options("/api/data", handler);  // CORS preflight
 A request to a known path with an unregistered method returns
 `405 Method Not Allowed`; an unknown path returns `404 Not Found`.
 
+## Middleware (Chain of Responsibility)
+
+Register global middleware with `server.use(...)`. A middleware is a plain
+function pointer — no `std::function`, no heap:
+
+```cpp
+void my_mw(const HttpRequest& req, HttpResponse& res, MiddlewareChain& chain);
+```
+
+Each middleware may inspect or modify the request/response, then call
+`chain.next(req, res)` to pass control to the next middleware and, finally, the
+route handler. Because `next()` is called *inside* the middleware, code placed
+**after** the call runs on the way back out — the "onion" model. This is ideal
+for timing, logging and response-header injection (CORS / security headers).
+
+```cpp
+// Security headers injected into every response (runs after the handler):
+server.use([](const HttpRequest& req, HttpResponse& res, MiddlewareChain& chain) {
+    chain.next(req, res);
+    res.add_header("X-Content-Type-Options", "nosniff");
+    res.add_header("X-Frame-Options", "DENY");
+});
+
+// Auth middleware that short-circuits the chain (handler never runs):
+server.use([](const HttpRequest& req, HttpResponse& res, MiddlewareChain& chain) {
+    if (req.get_header("X-API-Key") != "secret") {
+        res.set_status(401);
+        return;               // do NOT call next() -> handler is skipped
+    }
+    chain.next(req, res);
+});
+```
+
+Middleware run in registration order; two registered as `A` then `B` wrap the
+handler as `A → B → handler → B → A`. The table is a fixed-size array sized by
+the `UCHTTP_MAX_MIDDLEWARE` compile-time constant (default 8).
+
 
 ## Running tests
 
@@ -202,7 +240,7 @@ include/uchttp.h        Core library (header-only)
 src/linux_socket.h      POSIX LinuxSocket + LinuxAcceptor
 src/linux_server.cpp    Example server on localhost
 tests/mock_socket.h     In-memory socket for unit tests
-tests/test_uchttp.cpp   51 gtest unit tests
+tests/test_uchttp.cpp   61 gtest unit tests
 CMakeLists.txt          Build system
 third_party/llhttp/     llhttp v9.4.3
 ```

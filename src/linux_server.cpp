@@ -26,6 +26,35 @@ static void sigint_handler(int) {
 }
 
 // ---------------------------------------------------------------------------
+// Middleware (Chain of Responsibility) – requirement #2
+// ---------------------------------------------------------------------------
+
+// Logging middleware: records the method/path, runs the rest of the chain,
+// then logs the resulting status code. Code after chain.next() runs on the
+// way back out, so the response status is already set.
+static void mw_logger(const uchttp::HttpRequest& req,
+                      uchttp::HttpResponse& res,
+                      uchttp::MiddlewareChain& chain) {
+    const char* method = uchttp::method_string(req.method);
+    chain.next(req, res);   // run inner middleware + handler
+    std::printf("[HTTP] %s %.*s\n",
+                method,
+                static_cast<int>(req.path.size()), req.path.data());
+    std::fflush(stdout);
+}
+
+// Security-headers middleware: injects headers into every response after the
+// handler has produced its body (requirement #4/#5, applied globally here).
+static void mw_security_headers(const uchttp::HttpRequest& req,
+                                uchttp::HttpResponse& res,
+                                uchttp::MiddlewareChain& chain) {
+    chain.next(req, res);
+    res.add_header("X-Content-Type-Options", "nosniff");
+    res.add_header("X-Frame-Options", "DENY");
+    res.add_header("Access-Control-Allow-Origin", "*");
+}
+
+// ---------------------------------------------------------------------------
 // Route handlers
 // ---------------------------------------------------------------------------
 
@@ -116,6 +145,10 @@ int main() {
 
     Server   server;
     Acceptor acceptor(8080);
+
+    // Global middleware – run in registration order around every handler.
+    server.use(mw_logger);
+    server.use(mw_security_headers);
 
     server.get ("/",          handle_root);
     server.get ("/api/hello", handle_hello);

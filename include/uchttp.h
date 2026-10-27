@@ -21,6 +21,9 @@
 #ifndef UCHTTP_MAX_PATH_PARAMS
 #  define UCHTTP_MAX_PATH_PARAMS 8
 #endif
+#ifndef UCHTTP_MAX_MIDDLEWARE
+#  define UCHTTP_MAX_MIDDLEWARE 8
+#endif
 #ifndef UCHTTP_RX_BUFFER_SIZE
 #  define UCHTTP_RX_BUFFER_SIZE 1024
 #endif
@@ -317,6 +320,65 @@ struct Route {
 };
 
 // ---------------------------------------------------------------------------
+// Middleware (Chain of Responsibility)
+//
+// A middleware is a plain function pointer:
+//
+//     void mw(const HttpRequest& req, HttpResponse& res, MiddlewareChain& chain);
+//
+// It may inspect/modify the request and response, then call `chain.next()` to
+// pass control to the next middleware (and finally the route handler). A
+// middleware that does NOT call next() short-circuits the chain (e.g. an auth
+// middleware returning 401). Because next() is called *inside* the middleware,
+// code placed after the next() call runs on the way back out — ideal for
+// response-header injection (CORS/CSP), timing and logging.
+//
+// Zero heap: the chain is driven iteratively over a caller-owned array of
+// function pointers; no std::function, no allocation, no virtuals.
+// ---------------------------------------------------------------------------
+
+class MiddlewareChain;  // forward decl
+
+using MiddlewareFn = void (*)(const HttpRequest&, HttpResponse&, MiddlewareChain&);
+
+class MiddlewareChain {
+public:
+    MiddlewareChain(const MiddlewareFn* mws, size_t count,
+                    HandlerFn handler) noexcept
+        : mws_(mws), count_(count), handler_(handler) {}
+
+    // Advance to the next middleware, or invoke the final route handler once
+    // all middleware have run. Safe to call at most once per middleware.
+    void next(const HttpRequest& req, HttpResponse& res) noexcept {
+        if (index_ < count_) {
+            MiddlewareFn mw = mws_[index_++];
+            if (mw) {
+                mw(req, res, *this);
+            } else {
+                next(req, res);  // skip null slot
+            }
+        } else if (!handler_called_) {
+            handler_called_ = true;
+            if (handler_) handler_(req, res);
+        }
+    }
+
+    // Kick off the chain from the beginning.
+    void run(const HttpRequest& req, HttpResponse& res) noexcept {
+        index_ = 0;
+        handler_called_ = false;
+        next(req, res);
+    }
+
+private:
+    const MiddlewareFn* mws_   { nullptr };
+    size_t              count_ { 0 };
+    HandlerFn           handler_ { nullptr };
+    size_t              index_ { 0 };
+    bool                handler_called_ { false };
+};
+
+// ---------------------------------------------------------------------------
 // RouteTable  – templated on capacity, stays in header
 // ---------------------------------------------------------------------------
 
@@ -478,7 +540,9 @@ public:
     HttpConnection(HttpConnection&&)                 = default;
 
     template <size_t MaxRoutes>
-    bool process(const RouteTable<MaxRoutes>& routes) noexcept {
+    bool process(const RouteTable<MaxRoutes>& routes,
+                 const MiddlewareFn* middleware = nullptr,
+                 size_t middleware_count = 0) noexcept {
         state_.reset();
         llhttp_reset(&parser_);
 
@@ -516,7 +580,8 @@ public:
                                           state_.request.path,
                                           state_.request);
         if (route && route->handler) {
-            route->handler(state_.request, response_);
+            MiddlewareChain chain(middleware, middleware_count, route->handler);
+            chain.run(state_.request, response_);
             (void)response_.send(socket_);
         } else if (routes.path_exists(state_.request.path)) {
             // Path exists but not for this method -> 405 Method Not Allowed.
@@ -563,10 +628,19 @@ concept AcceptorConcept = requires(T& a) {
 template <SocketConcept Socket,
           size_t MaxRoutes = UCHTTP_MAX_ROUTES,
           size_t RxSize    = UCHTTP_RX_BUFFER_SIZE,
-          size_t TxSize    = UCHTTP_TX_BUFFER_SIZE>
+          size_t TxSize    = UCHTTP_TX_BUFFER_SIZE,
+          size_t MaxMiddleware = UCHTTP_MAX_MIDDLEWARE>
 class HttpServer {
 public:
     HttpServer() = default;
+
+    // Register a global middleware. Middleware run in registration order,
+    // before the matched route handler. Returns false if the table is full.
+    bool use(MiddlewareFn mw) noexcept {
+        if (mw_count_ >= MaxMiddleware) return false;
+        middleware_[mw_count_++] = mw;
+        return true;
+    }
 
     bool add_route(HttpMethod method, std::string_view path,
                    HandlerFn handler) noexcept {
@@ -589,7 +663,7 @@ public:
             if (!sock.is_valid()) continue;
 
             HttpConnection<Socket, RxSize, TxSize> conn(static_cast<Socket&&>(sock));
-            conn.process(routes_);
+            conn.process(routes_, middleware_, mw_count_);
             conn.close();
         }
     }
@@ -601,14 +675,18 @@ public:
         if (!sock.is_valid()) return;
 
         HttpConnection<Socket, RxSize, TxSize> conn(static_cast<Socket&&>(sock));
-        conn.process(routes_);
+        conn.process(routes_, middleware_, mw_count_);
         conn.close();
     }
 
     const RouteTable<MaxRoutes>& routes() const noexcept { return routes_; }
 
+    size_t middleware_count() const noexcept { return mw_count_; }
+
 private:
     RouteTable<MaxRoutes> routes_;
+    MiddlewareFn          middleware_[MaxMiddleware] {};
+    size_t                mw_count_ { 0 };
 };
 
 } // namespace uchttp

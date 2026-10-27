@@ -887,3 +887,242 @@ TEST(HttpServerTest, MethodHelpersRegisterRoutes) {
     EXPECT_NE(rt.find(HttpMethod::DELETE,  "/d", req), nullptr);
     EXPECT_NE(rt.find(HttpMethod::OPTIONS, "/g", req), nullptr);
 }
+
+// ===========================================================================
+// Middleware (Chain of Responsibility)
+// ===========================================================================
+
+namespace {
+    // Shared trace so middleware/handlers can record execution order.
+    std::string g_trace;
+
+    void mw_append(const char* tag) { g_trace += tag; }
+}
+
+TEST(MiddlewareTest, SingleMiddlewareCallsNextThenHandler) {
+    g_trace.clear();
+    RouteTable<8> rt;
+    rt.add(HttpMethod::GET, "/mw", [](const HttpRequest&, HttpResponse& res) {
+        mw_append("H");
+        res.set_status(200);
+        res.set_body("ok");
+    });
+
+    MiddlewareFn mws[] = {
+        [](const HttpRequest& req, HttpResponse& res, MiddlewareChain& chain) {
+            mw_append("A>");
+            chain.next(req, res);
+            mw_append("<A");
+        },
+    };
+
+    const std::string raw = "GET /mw HTTP/1.1\r\nHost: x\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt, mws, 1);
+
+    EXPECT_EQ(parse_status_code(tx), 200);
+    EXPECT_EQ(g_trace, "A>H<A");  // pre, handler, post (on the way out)
+}
+
+TEST(MiddlewareTest, MultipleMiddlewareExecuteInOrder) {
+    g_trace.clear();
+    RouteTable<8> rt;
+    rt.add(HttpMethod::GET, "/mw", [](const HttpRequest&, HttpResponse& res) {
+        mw_append("H");
+        res.set_status(200);
+    });
+
+    MiddlewareFn mws[] = {
+        [](const HttpRequest& req, HttpResponse& res, MiddlewareChain& chain) {
+            mw_append("1>"); chain.next(req, res); mw_append("<1");
+        },
+        [](const HttpRequest& req, HttpResponse& res, MiddlewareChain& chain) {
+            mw_append("2>"); chain.next(req, res); mw_append("<2");
+        },
+    };
+
+    const std::string raw = "GET /mw HTTP/1.1\r\nHost: x\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt, mws, 2);
+
+    // onion model: 1 wraps 2 wraps handler
+    EXPECT_EQ(g_trace, "1>2>H<2<1");
+}
+
+TEST(MiddlewareTest, ShortCircuitSkipsHandler) {
+    g_trace.clear();
+    RouteTable<8> rt;
+    rt.add(HttpMethod::GET, "/secret", [](const HttpRequest&, HttpResponse& res) {
+        mw_append("H");  // must NOT run
+        res.set_status(200);
+    });
+
+    // Auth-like middleware that rejects and does NOT call next().
+    MiddlewareFn mws[] = {
+        [](const HttpRequest&, HttpResponse& res, MiddlewareChain&) {
+            mw_append("DENY");
+            res.set_status(401);
+            res.set_body("unauthorized");
+        },
+    };
+
+    const std::string raw = "GET /secret HTTP/1.1\r\nHost: x\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt, mws, 1);
+
+    EXPECT_EQ(parse_status_code(tx), 401);
+    EXPECT_EQ(g_trace, "DENY");          // handler never ran
+}
+
+TEST(MiddlewareTest, SecondMiddlewareCanShortCircuit) {
+    g_trace.clear();
+    RouteTable<8> rt;
+    rt.add(HttpMethod::GET, "/mw", [](const HttpRequest&, HttpResponse& res) {
+        mw_append("H");
+        res.set_status(200);
+    });
+
+    MiddlewareFn mws[] = {
+        [](const HttpRequest& req, HttpResponse& res, MiddlewareChain& chain) {
+            mw_append("1>"); chain.next(req, res); mw_append("<1");
+        },
+        [](const HttpRequest&, HttpResponse& res, MiddlewareChain&) {
+            mw_append("STOP");
+            res.set_status(403);
+        },
+    };
+
+    const std::string raw = "GET /mw HTTP/1.1\r\nHost: x\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt, mws, 2);
+
+    EXPECT_EQ(parse_status_code(tx), 403);
+    EXPECT_EQ(g_trace, "1>STOP<1");  // mw1 pre/post run, handler skipped
+}
+
+TEST(MiddlewareTest, MiddlewareInjectsResponseHeader) {
+    RouteTable<8> rt;
+    rt.add(HttpMethod::GET, "/data", [](const HttpRequest&, HttpResponse& res) {
+        res.set_status(200);
+        res.set_body("{}");
+    });
+
+    // Security-header middleware: inject headers after the handler runs.
+    MiddlewareFn mws[] = {
+        [](const HttpRequest& req, HttpResponse& res, MiddlewareChain& chain) {
+            chain.next(req, res);
+            res.add_header("X-Content-Type-Options", "nosniff");
+            res.add_header("Access-Control-Allow-Origin", "*");
+        },
+    };
+
+    const std::string raw = "GET /data HTTP/1.1\r\nHost: x\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt, mws, 1);
+
+    EXPECT_EQ(parse_status_code(tx), 200);
+    EXPECT_EQ(header_value(tx, "X-Content-Type-Options"), "nosniff");
+    EXPECT_EQ(header_value(tx, "Access-Control-Allow-Origin"), "*");
+}
+
+TEST(MiddlewareTest, NullSlotIsSkipped) {
+    g_trace.clear();
+    RouteTable<8> rt;
+    rt.add(HttpMethod::GET, "/mw", [](const HttpRequest&, HttpResponse& res) {
+        mw_append("H");
+        res.set_status(200);
+    });
+
+    MiddlewareFn mws[] = {
+        nullptr,  // null slot must be skipped gracefully
+        [](const HttpRequest& req, HttpResponse& res, MiddlewareChain& chain) {
+            mw_append("A"); chain.next(req, res);
+        },
+    };
+
+    const std::string raw = "GET /mw HTTP/1.1\r\nHost: x\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt, mws, 2);
+
+    EXPECT_EQ(parse_status_code(tx), 200);
+    EXPECT_EQ(g_trace, "AH");
+}
+
+TEST(MiddlewareTest, NoMiddlewareRunsHandlerDirectly) {
+    g_trace.clear();
+    RouteTable<8> rt;
+    rt.add(HttpMethod::GET, "/mw", [](const HttpRequest&, HttpResponse& res) {
+        mw_append("H");
+        res.set_status(200);
+    });
+
+    const std::string raw = "GET /mw HTTP/1.1\r\nHost: x\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt, nullptr, 0);
+
+    EXPECT_EQ(parse_status_code(tx), 200);
+    EXPECT_EQ(g_trace, "H");
+}
+
+TEST(MiddlewareChainTest, StandaloneRunWithoutSocket) {
+    // Exercise MiddlewareChain directly, no parsing/socket involved.
+    g_trace.clear();
+    char buf[256];
+    HttpResponse res;
+    res.bind(std::span<char>(buf, sizeof(buf)));
+    HttpRequest req;
+
+    MiddlewareFn mws[] = {
+        [](const HttpRequest& r, HttpResponse& s, MiddlewareChain& c) {
+            mw_append("a"); c.next(r, s); mw_append("A");
+        },
+    };
+    HandlerFn handler = [](const HttpRequest&, HttpResponse& s) {
+        mw_append("H"); s.set_status(200);
+    };
+
+    MiddlewareChain chain(mws, 1, handler);
+    chain.run(req, res);
+    EXPECT_EQ(g_trace, "aHA");
+}
+
+// ===========================================================================
+// HttpServer middleware registration
+// ===========================================================================
+
+TEST(HttpServerTest, UseRegistersMiddleware) {
+    HttpServer<MockSocket> server;
+    auto mw = [](const HttpRequest& r, HttpResponse& s, MiddlewareChain& c) {
+        c.next(r, s);
+    };
+    EXPECT_TRUE(server.use(mw));
+    EXPECT_TRUE(server.use(mw));
+    EXPECT_EQ(server.middleware_count(), 2u);
+}
+
+TEST(HttpServerTest, UseRespectsCapacity) {
+    // MaxMiddleware template param = 2
+    HttpServer<MockSocket, UCHTTP_MAX_ROUTES, UCHTTP_RX_BUFFER_SIZE,
+               UCHTTP_TX_BUFFER_SIZE, 2> server;
+    auto mw = [](const HttpRequest& r, HttpResponse& s, MiddlewareChain& c) {
+        c.next(r, s);
+    };
+    EXPECT_TRUE(server.use(mw));
+    EXPECT_TRUE(server.use(mw));
+    EXPECT_FALSE(server.use(mw));  // full
+    EXPECT_EQ(server.middleware_count(), 2u);
+}
