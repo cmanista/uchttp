@@ -42,6 +42,7 @@ classDiagram
         DELETE
         PATCH
         HEAD
+        OPTIONS
         UNKNOWN
     }
 
@@ -51,14 +52,37 @@ classDiagram
         +value : string_view
     }
 
+    class PathParam {
+        <<struct>>
+        +name : string_view
+        +value : string_view
+    }
+
+    class QueryString {
+        +QueryString(raw : string_view)
+        +begin() iterator
+        +end() iterator
+        +get(key) string_view
+        +has(key) bool
+        +empty() bool
+        +raw() string_view
+        -raw_ : string_view
+    }
+
     class HttpRequest {
         <<struct>>
         +method : HttpMethod
         +path : string_view
+        +raw_query : string_view
         +body : string_view
         +header_count : uint8_t
         +headers : HttpHeader[UCHTTP_MAX_HEADERS]
+        +param_count : uint8_t
+        +path_params : PathParam[UCHTTP_MAX_PATH_PARAMS]
         +get_header(name) string_view
+        +query() QueryString
+        +query_param(key) string_view
+        +path_param(name) string_view
         +reset() void
     }
 
@@ -91,10 +115,24 @@ classDiagram
         +handler : HandlerFn
     }
 
+    class MiddlewareChain {
+        +MiddlewareChain(mws, count, handler)
+        +next(req, res) void
+        +run(req, res) void
+        -mws_ : const MiddlewareFn*
+        -count_ : size_t
+        -handler_ : HandlerFn
+        -index_ : size_t
+        -handler_called_ : bool
+    }
+
     class RouteTable~MaxRoutes~ {
         +add(method, path, handler) bool
         +find(method, path) const Route*
+        +find(method, path, req) const Route*
+        +path_exists(path) bool
         +size() size_t
+        +operator[](i) const Route&
         -routes_ : Route[MaxRoutes]
         -count_ : size_t
     }
@@ -115,7 +153,7 @@ classDiagram
 
     class HttpConnection~Socket_RxSize_TxSize~ {
         +HttpConnection(socket)
-        +process(routes) bool
+        +process(routes, middleware, mw_count) bool
         +close() void
         -socket_ : Socket
         -state_ : ParseState
@@ -126,15 +164,23 @@ classDiagram
         -send_error(code, msg) void
     }
 
-    class HttpServer~Socket_MaxRoutes_RxSize_TxSize~ {
+    class HttpServer~Socket_MaxRoutes_RxSize_TxSize_MaxMiddleware~ {
         +add_route(method, path, handler) bool
         +get(path, handler) bool
         +post(path, handler) bool
         +put(path, handler) bool
+        +del(path, handler) bool
+        +patch(path, handler) bool
+        +head(path, handler) bool
+        +options(path, handler) bool
+        +use(mw) bool
         +run(acceptor) void
         +poll(acceptor) void
         +routes() const RouteTable~MaxRoutes~&
+        +middleware_count() size_t
         -routes_ : RouteTable~MaxRoutes~
+        -middleware_ : MiddlewareFn[MaxMiddleware]
+        -mw_count_ : size_t
     }
 
     %% -----------------------------------------------------------------------
@@ -217,20 +263,25 @@ classDiagram
     SocketBase~Derived~ <|-- LinuxSocket : extends (CRTP)
 
     %% Composition / aggregation
-    HttpServer~Socket_MaxRoutes_RxSize_TxSize~ *-- RouteTable~MaxRoutes~ : contains
+    HttpServer~Socket_MaxRoutes_RxSize_TxSize_MaxMiddleware~ *-- RouteTable~MaxRoutes~ : contains
+    HttpServer~Socket_MaxRoutes_RxSize_TxSize_MaxMiddleware~ *-- MiddlewareFn : holds 0..*
     HttpConnection~Socket_RxSize_TxSize~ *-- ParseState  : contains
     HttpConnection~Socket_RxSize_TxSize~ *-- HttpResponse : contains
     HttpConnection~Socket_RxSize_TxSize~ *-- llhttp_t     : uses
     ParseState *-- HttpRequest : contains
     HttpRequest *-- HttpHeader : contains 0..*
+    HttpRequest *-- PathParam : contains 0..*
+    HttpRequest ..> QueryString : creates (lazy)
     HttpResponse *-- HttpHeader : contains 0..*
     RouteTable~MaxRoutes~ *-- Route : contains 0..*
     Route --> HttpMethod : uses
     HttpRequest --> HttpMethod : uses
 
     %% Usage relationships
-    HttpServer~Socket_MaxRoutes_RxSize_TxSize~ ..> HttpConnection~Socket_RxSize_TxSize~ : creates per request
+    HttpServer~Socket_MaxRoutes_RxSize_TxSize_MaxMiddleware~ ..> HttpConnection~Socket_RxSize_TxSize~ : creates per request
     HttpConnection~Socket_RxSize_TxSize~ ..> RouteTable~MaxRoutes~ : looks up route
+    HttpConnection~Socket_RxSize_TxSize~ ..> MiddlewareChain : builds & runs
+    MiddlewareChain ..> HandlerFn : invokes final
     HttpResponse ..> SocketConcept : sends via
     LinuxAcceptor ..> LinuxSocket : produces
     MockAcceptor  ..> MockSocket  : produces
@@ -242,5 +293,8 @@ classDiagram
 - `SocketConcept` and `AcceptorConcept` are C++20 concepts, shown as interfaces for diagram clarity.
 - `SocketBase<Derived>` is an optional CRTP helper; `LinuxSocket` currently inherits from it.
 - `HandlerFn` is a plain function pointer `void(*)(const HttpRequest&, HttpResponse&)` and is embedded in `Route` rather than shown as a separate class.
+- `MiddlewareFn` is a plain function pointer `void(*)(const HttpRequest&, HttpResponse&, MiddlewareChain&)`. Middleware form a Chain of Responsibility: `MiddlewareChain::next()` advances to the next middleware or invokes the final route handler ("onion" model — code after `next()` runs on the way out). `HttpServer` holds a fixed array of up to `MaxMiddleware` (`UCHTTP_MAX_MIDDLEWARE`) function pointers registered via `use()`.
+- `QueryString` is an allocation-free, lazy iterator over `key=value&...` pairs from `HttpRequest::raw_query`; it is created on demand by `HttpRequest::query()` and owns no storage beyond a `string_view`.
+- `PathParam` holds a captured `{name}` URL segment as zero-copy `string_view`s into the RX buffer; `RouteTable::find(method, path, req)` fills `HttpRequest::path_params` during pattern matching.
 - `llhttp_t` is the opaque parser struct from the third-party llhttp library.
-- All buffers (`rx_buf_`, `tx_buf_`) are stack/static — no heap allocation anywhere in the library.
+- All buffers (`rx_buf_`, `tx_buf_`) and tables (routes, middleware, headers, path params) are stack/static — no heap allocation anywhere in the library.
