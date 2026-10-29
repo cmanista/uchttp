@@ -200,19 +200,12 @@ struct HttpRequest {
 
     std::string_view get_header(std::string_view name) const noexcept;
 
-    // Query string accessors -------------------------------------------------
-    QueryString      query() const noexcept { return QueryString(raw_query); }
-    std::string_view query_param(std::string_view key) const noexcept {
-        return QueryString(raw_query).get(key);
-    }
+    // Query string accessors (defined in uchttp.cpp) ------------------------
+    QueryString      query() const noexcept;
+    std::string_view query_param(std::string_view key) const noexcept;
 
-    // Path parameter accessor ------------------------------------------------
-    std::string_view path_param(std::string_view name) const noexcept {
-        for (uint8_t i = 0; i < param_count; ++i) {
-            if (path_params[i].name == name) return path_params[i].value;
-        }
-        return {};
-    }
+    // Path parameter accessor (defined in uchttp.cpp) -----------------------
+    std::string_view path_param(std::string_view name) const noexcept;
 
     void reset() noexcept;
 };
@@ -344,31 +337,15 @@ using MiddlewareFn = void (*)(const HttpRequest&, HttpResponse&, MiddlewareChain
 class MiddlewareChain {
 public:
     MiddlewareChain(const MiddlewareFn* mws, size_t count,
-                    HandlerFn handler) noexcept
-        : mws_(mws), count_(count), handler_(handler) {}
+                    HandlerFn handler) noexcept;
 
     // Advance to the next middleware, or invoke the final route handler once
     // all middleware have run. Safe to call at most once per middleware.
-    void next(const HttpRequest& req, HttpResponse& res) noexcept {
-        if (index_ < count_) {
-            MiddlewareFn mw = mws_[index_++];
-            if (mw) {
-                mw(req, res, *this);
-            } else {
-                next(req, res);  // skip null slot
-            }
-        } else if (!handler_called_) {
-            handler_called_ = true;
-            if (handler_) handler_(req, res);
-        }
-    }
+    // Non-template, called once per middleware/request — body in uchttp.cpp.
+    void next(const HttpRequest& req, HttpResponse& res) noexcept;
 
     // Kick off the chain from the beginning.
-    void run(const HttpRequest& req, HttpResponse& res) noexcept {
-        index_ = 0;
-        handler_called_ = false;
-        next(req, res);
-    }
+    void run(const HttpRequest& req, HttpResponse& res) noexcept;
 
 private:
     const MiddlewareFn* mws_   { nullptr };

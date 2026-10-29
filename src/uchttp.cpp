@@ -44,6 +44,21 @@ std::string_view HttpRequest::get_header(std::string_view name) const noexcept {
     return {};
 }
 
+QueryString HttpRequest::query() const noexcept {
+    return QueryString(raw_query);
+}
+
+std::string_view HttpRequest::query_param(std::string_view key) const noexcept {
+    return QueryString(raw_query).get(key);
+}
+
+std::string_view HttpRequest::path_param(std::string_view name) const noexcept {
+    for (uint8_t i = 0; i < param_count; ++i) {
+        if (path_params[i].name == name) return path_params[i].value;
+    }
+    return {};
+}
+
 void HttpRequest::reset() noexcept {
     method       = HttpMethod::UNKNOWN;
     path         = {};
@@ -133,6 +148,36 @@ void HttpResponse::append_int(int v) noexcept {
     while (uv) { tmp[--i] = '0' + static_cast<char>(uv % 10); uv /= 10; }
     if (neg) tmp[--i] = '-';
     append(std::string_view(tmp + i));
+}
+
+// ---------------------------------------------------------------------------
+// MiddlewareChain – non-template; invoked once per middleware per request, so
+// the function-call cost is negligible next to socket I/O. Bodies live here to
+// keep the header lean (product.md: implement in .cpp where no perf loss).
+// ---------------------------------------------------------------------------
+
+MiddlewareChain::MiddlewareChain(const MiddlewareFn* mws, size_t count,
+                                 HandlerFn handler) noexcept
+    : mws_(mws), count_(count), handler_(handler) {}
+
+void MiddlewareChain::next(const HttpRequest& req, HttpResponse& res) noexcept {
+    if (index_ < count_) {
+        MiddlewareFn mw = mws_[index_++];
+        if (mw) {
+            mw(req, res, *this);
+        } else {
+            next(req, res);  // skip null slot
+        }
+    } else if (!handler_called_) {
+        handler_called_ = true;
+        if (handler_) handler_(req, res);
+    }
+}
+
+void MiddlewareChain::run(const HttpRequest& req, HttpResponse& res) noexcept {
+    index_ = 0;
+    handler_called_ = false;
+    next(req, res);
 }
 
 // ---------------------------------------------------------------------------
