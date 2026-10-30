@@ -141,6 +141,33 @@ static void handle_options_data(const uchttp::HttpRequest& /*req*/,
     res.add_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
 }
 
+// OTA streaming upload (requirement #7): body is delivered in chunks straight
+// to a "flasher" without ever buffering the whole firmware image in RAM.
+static void handle_ota(const uchttp::HttpRequest& /*req*/,
+                       uchttp::HttpResponse& res,
+                       std::span<const uint8_t> chunk,
+                       size_t offset, bool last) {
+    // In a real device: flash_write(partition, offset, chunk).
+    (void)chunk; (void)offset;
+    if (last) {
+        res.set_status(201);
+        res.set_content_type("application/json");
+        res.set_body(R"({"status":"flashed"})");
+    }
+}
+
+// SSE telemetry (requirement #7): stream a few sensor events then finish.
+static void handle_events(const uchttp::HttpRequest& /*req*/,
+                          uchttp::HttpResponse& res) {
+    if (!res.begin_sse()) return;
+    for (int i = 0; i < 3; ++i) {
+        char buf[64];
+        int n = std::snprintf(buf, sizeof(buf), R"({"seq":%d,"temp":23.%d})", i, i);
+        res.send_event(std::string_view(buf, static_cast<size_t>(n)),
+                       "telemetry");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -172,6 +199,10 @@ int main() {
     server.del    ("/api/sensors/{id}", handle_delete_sensor);  // DELETE method
     server.get    ("/api/search",       handle_search);         // query string
     server.options("/api/data",         handle_options_data);   // OPTIONS/CORS
+
+    // IoT edge capabilities (requirement #7):
+    server.post_stream("/api/ota",    handle_ota);      // streaming OTA upload
+    server.get        ("/api/events", handle_events);   // SSE telemetry
 
     if (!acceptor.start()) {
         std::fprintf(stderr, "Failed to start acceptor on port 8080\n");

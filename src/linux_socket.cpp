@@ -99,9 +99,18 @@ bool LinuxAcceptor::start() noexcept {
     return true;
 }
 
-void LinuxAcceptor::stop() noexcept { running_ = false; }
+void LinuxAcceptor::stop() noexcept {
+    running_ = false;
+    // Wake up a thread blocked in accept(): shutting the listening socket down
+    // makes the pending accept() return immediately so run() can exit cleanly
+    // (graceful shutdown, requirement #6). The fd is closed in the destructor.
+    if (listen_fd_ >= 0) {
+        ::shutdown(listen_fd_, SHUT_RDWR);
+    }
+}
 
 LinuxSocket LinuxAcceptor::accept() noexcept {
+    if (!running_) return LinuxSocket(LinuxSocket::INVALID_FD);
     sockaddr_in client{};
     socklen_t   len = sizeof(client);
     int cfd = ::accept(listen_fd_,

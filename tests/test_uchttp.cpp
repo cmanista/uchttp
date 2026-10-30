@@ -1897,3 +1897,182 @@ TEST(HttpServerTest, PoolIntrospection) {
     server.shutdown();                    // safe to call when idle
     EXPECT_EQ(server.active_connections(), 0u);
 }
+
+// ===========================================================================
+// Requirement #7 — IoT edge: streaming body (OTA) and Server-Sent Events
+// ===========================================================================
+
+// --- Server-Sent Events ----------------------------------------------------
+
+TEST(EdgeSseTest, BeginSseEmitsEventStreamHeaders) {
+    RouteTable<8> rt;
+    rt.add(HttpMethod::GET, "/events", [](const HttpRequest&, HttpResponse& res) {
+        ASSERT_TRUE(res.begin_sse());
+        res.send_event("hello");
+    });
+
+    const std::string raw =
+        "GET /events HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt);
+
+    EXPECT_NE(tx.find("HTTP/1.1 200 OK"), std::string::npos);
+    EXPECT_NE(tx.find("Content-Type: text/event-stream"), std::string::npos);
+    EXPECT_NE(tx.find("Cache-Control: no-cache"), std::string::npos);
+    // The event frame.
+    EXPECT_NE(tx.find("data: hello\n\n"), std::string::npos);
+}
+
+TEST(EdgeSseTest, SendEventWithIdAndEvent) {
+    RouteTable<8> rt;
+    rt.add(HttpMethod::GET, "/events", [](const HttpRequest&, HttpResponse& res) {
+        res.begin_sse();
+        res.send_event("23.5", "temperature", "42");
+    });
+
+    const std::string raw =
+        "GET /events HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt);
+
+    EXPECT_NE(tx.find("id: 42\n"), std::string::npos);
+    EXPECT_NE(tx.find("event: temperature\n"), std::string::npos);
+    EXPECT_NE(tx.find("data: 23.5\n\n"), std::string::npos);
+}
+
+TEST(EdgeSseTest, MultiLineDataSplitIntoDataLines) {
+    RouteTable<8> rt;
+    rt.add(HttpMethod::GET, "/events", [](const HttpRequest&, HttpResponse& res) {
+        res.begin_sse();
+        res.send_event("line1\nline2");
+    });
+
+    const std::string raw =
+        "GET /events HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt);
+
+    EXPECT_NE(tx.find("data: line1\ndata: line2\n\n"), std::string::npos);
+}
+
+TEST(EdgeSseTest, HijackSuppressesEngineResponse) {
+    // After begin_sse the engine must NOT append its own buffered response.
+    RouteTable<8> rt;
+    rt.add(HttpMethod::GET, "/events", [](const HttpRequest&, HttpResponse& res) {
+        res.begin_sse();
+        res.send_event("x");
+        EXPECT_TRUE(res.hijacked());
+    });
+
+    const std::string raw =
+        "GET /events HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt);
+
+    // Exactly one status line (no duplicate engine response appended).
+    EXPECT_EQ(count_responses(tx), 1);
+}
+
+// --- Streaming body / OTA --------------------------------------------------
+
+namespace {
+    struct OtaRecord {
+        std::string received;     // reassembled payload
+        size_t      chunks { 0 };
+        bool        got_last { false };
+        size_t      last_offset { 0 };
+    };
+    OtaRecord g_ota;
+
+    void ota_sink(const HttpRequest&, HttpResponse& res,
+                  std::span<const uint8_t> chunk, size_t offset, bool last) {
+        g_ota.received.append(reinterpret_cast<const char*>(chunk.data()),
+                              chunk.size());
+        ++g_ota.chunks;
+        if (last) {
+            g_ota.got_last    = true;
+            g_ota.last_offset = offset;
+            res.set_status(201);
+            res.set_body("flashed");
+        }
+    }
+}
+
+TEST(EdgeStreamTest, StreamingBodyDeliversAllBytes) {
+    g_ota = {};
+    RouteTable<8> rt;
+    rt.add_stream(HttpMethod::POST, "/ota", ota_sink);
+
+    std::string payload(3000, 'F');   // > UCHTTP_MAX_BODY_BYTES is fine here
+    std::string raw =
+        "POST /ota HTTP/1.1\r\nHost: x\r\n"
+        "Content-Length: " + std::to_string(payload.size()) + "\r\n"
+        "Connection: close\r\n\r\n" + payload;
+
+    std::string tx;
+    // Large RX buffer so the whole payload is delivered in chunks.
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket, 8192> conn(std::move(sock));
+    conn.process(rt);
+
+    EXPECT_EQ(g_ota.received, payload);       // every byte delivered
+    EXPECT_TRUE(g_ota.got_last);              // finalisation signalled
+    EXPECT_EQ(g_ota.last_offset, payload.size());
+    EXPECT_EQ(parse_status_code(tx), 201);    // handler's response sent
+}
+
+TEST(EdgeStreamTest, StreamingBodyChunkedEncoding) {
+    g_ota = {};
+    RouteTable<8> rt;
+    rt.add_stream(HttpMethod::POST, "/ota", ota_sink);
+
+    const std::string raw =
+        "POST /ota HTTP/1.1\r\nHost: x\r\n"
+        "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        "4\r\nWiki\r\n"
+        "5\r\npedia\r\n"
+        "0\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt);
+
+    EXPECT_EQ(g_ota.received, "Wikipedia");
+    EXPECT_TRUE(g_ota.got_last);
+}
+
+TEST(EdgeStreamTest, StreamingBodyNotCappedByBodyLimit) {
+    // A streaming payload larger than UCHTTP_MAX_BODY_BYTES must NOT trigger
+    // 413 — the whole point of OTA streaming is to avoid buffering it.
+    g_ota = {};
+    RouteTable<8> rt;
+    rt.add_stream(HttpMethod::POST, "/ota", ota_sink);
+
+    std::string payload(UCHTTP_MAX_BODY_BYTES + 2000, 'Z');
+    std::string raw =
+        "POST /ota HTTP/1.1\r\nHost: x\r\n"
+        "Content-Length: " + std::to_string(payload.size()) + "\r\n"
+        "Connection: close\r\n\r\n" + payload;
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket, 16384> conn(std::move(sock));
+    conn.process(rt);
+
+    EXPECT_EQ(g_ota.received.size(), payload.size());
+    EXPECT_NE(parse_status_code(tx), 413);
+}
+
+TEST(HttpServerTest, StreamRouteHelpers) {
+    HttpServer<MockSocket> server;
+    EXPECT_TRUE(server.post_stream("/ota", ota_sink));
+    EXPECT_TRUE(server.put_stream("/fw", ota_sink));
+    EXPECT_EQ(server.routes().size(), 2u);
+}

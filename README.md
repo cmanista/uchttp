@@ -354,6 +354,44 @@ curl -k https://localhost:8443/api/hello
 LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu ./build/uchttp_tests
 ```
 
+## IoT edge capabilities
+
+### Streaming body / OTA firmware upload
+
+A streaming route hands the request body to the handler in chunks as it
+arrives — the engine never buffers the whole payload, so a multi-megabyte
+firmware image flows straight to the flash writer (requirement #7):
+
+```cpp
+void ota(const HttpRequest& req, HttpResponse& res,
+         std::span<const uint8_t> chunk, size_t offset, bool last) {
+    flash_write(partition, offset, chunk);      // no RAM buffering
+    if (last) { res.set_status(201); res.set_body("flashed"); }
+}
+server.post_stream("/api/ota", ota);            // also put_stream(...)
+```
+
+Chunks are views into the RX buffer (zero copy); both `Content-Length` and
+`Transfer-Encoding: chunked` uploads are supported, and the body-size cap
+(`UCHTTP_MAX_BODY_BYTES`) does **not** apply to streaming routes.
+
+### Server-Sent Events (SSE)
+
+The handler keeps the connection open and pushes `text/event-stream` frames
+straight to the socket:
+
+```cpp
+server.get("/api/events", [](const HttpRequest& req, HttpResponse& res) {
+    res.begin_sse();                            // 200 + text/event-stream
+    res.send_event("23.5", "temperature", "42"); // data / event / id
+});
+```
+
+`begin_sse()` emits the status line and headers; `send_event()` writes one
+frame (multi-line data is split into several `data:` lines). Once the handler
+streams its own bytes it "hijacks" the response, so the engine does not append
+a buffered reply. Both work unchanged over TLS (`TlsSocket`).
+
 ## Reliability & resource management
 
 On an MCU the socket/descriptor pool is tiny, so uchttp never allocates a
@@ -400,7 +438,7 @@ src/linux_socket.h        POSIX LinuxSocket + LinuxAcceptor
 src/linux_server.cpp      Example HTTP server on localhost
 src/linux_https_server.cpp Example HTTPS server (OpenSSL)
 tests/mock_socket.h       In-memory socket for unit tests
-tests/test_uchttp.cpp     101 gtest unit tests
+tests/test_uchttp.cpp     109 gtest unit tests
 CMakeLists.txt            Build system
 third_party/llhttp/       llhttp v9.4.3
 ```

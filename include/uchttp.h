@@ -248,6 +248,10 @@ struct HttpRequest {
 
 class HttpResponse {
 public:
+    // Type-erased raw writer (fn pointer + context) for streaming/SSE — bound
+    // by HttpConnection, which knows the concrete Socket. No virtuals.
+    using RawWriteFn = int (*)(void* ctx, const uint8_t* data, size_t len) noexcept;
+
     void bind(std::span<char> tx_buf) noexcept;
     void set_status(int code, std::string_view reason = {}) noexcept;
     void add_header(std::string_view name, std::string_view value) noexcept;
@@ -266,6 +270,33 @@ public:
     int              status() const noexcept;
     std::string_view body()  const noexcept;
     std::string_view content_type() const noexcept;
+
+    // --- Streaming / SSE (requirement #7) ----------------------------------
+    // Bound by HttpConnection with a raw writer over the concrete socket.
+    void bind_stream(RawWriteFn fn, void* ctx) noexcept;
+
+    // Write raw bytes straight to the socket (bypasses the TX buffer). Returns
+    // bytes written or -1. Marks the response as hijacked. Used to stream large
+    // payloads (OTA progress) or SSE frames without buffering them.
+    int write_raw(std::span<const uint8_t> data) noexcept;
+    int write_raw(std::string_view s) noexcept;
+
+    // True once the handler has taken over the stream; the engine then skips
+    // its own buffered send().
+    bool hijacked() const noexcept;
+
+    // Begin a Server-Sent Events stream: emits the status line + headers
+    // (200, Content-Type: text/event-stream, Cache-Control: no-cache,
+    // Connection: keep-alive) directly to the socket. After this call, use
+    // send_event(). Returns false if no stream is bound.
+    bool begin_sse() noexcept;
+
+    // Send one SSE event. `data` is required; `event` and `id` are optional
+    // (pass {} to omit). Multi-line data is split into several "data:" lines.
+    // Must be called after begin_sse(). Returns false on write error.
+    bool send_event(std::string_view data,
+                    std::string_view event = {},
+                    std::string_view id    = {}) noexcept;
 
     void reset() noexcept;
 
@@ -352,6 +383,15 @@ private:
     uint8_t    hdr_count_ { 0 };
     HttpHeader resp_headers_[UCHTTP_MAX_HEADERS];
 
+    // Streaming / SSE (requirement #7). A type-erased raw writer bound by
+    // HttpConnection (which knows the concrete Socket) — fn pointer + context,
+    // no virtuals (consistent with the CRTP design). When a handler takes over
+    // the stream (OTA progress, SSE) it sets hijacked_ so the engine does not
+    // append its own buffered response afterwards.
+    RawWriteFn stream_write_ { nullptr };
+    void*      stream_ctx_   { nullptr };
+    bool       hijacked_     { false };
+
     // Helpers called only from the templated send() above – must stay in header
     static const char* default_reason(int code) noexcept;
     void append(std::string_view s) noexcept;
@@ -365,10 +405,20 @@ private:
 
 using HandlerFn = void (*)(const HttpRequest&, HttpResponse&);
 
+// Streaming body handler (requirement #7, OTA). Invoked repeatedly by the
+// engine as body bytes arrive — `chunk` is a view into the RX buffer (zero
+// copy), `last` is true on the final call (after the whole body). The handler
+// forwards bytes straight to a flasher/sink without the engine ever buffering
+// the full payload. `offset` is the running byte count already delivered.
+using StreamHandlerFn = void (*)(const HttpRequest& req, HttpResponse& res,
+                                 std::span<const uint8_t> chunk,
+                                 size_t offset, bool last);
+
 struct Route {
     HttpMethod       method  { HttpMethod::UNKNOWN };
     std::string_view path;
     HandlerFn        handler { nullptr };
+    StreamHandlerFn  stream  { nullptr };   // non-null => streaming route
 };
 
 // ---------------------------------------------------------------------------
@@ -423,7 +473,16 @@ class RouteTable {
 public:
     bool add(HttpMethod method, std::string_view path, HandlerFn handler) noexcept {
         if (count_ >= MaxRoutes) return false;
-        routes_[count_++] = { method, path, handler };
+        routes_[count_++] = { method, path, handler, nullptr };
+        return true;
+    }
+
+    // Register a streaming (OTA) route: the handler receives body bytes in
+    // chunks as they arrive, without the engine buffering the whole payload.
+    bool add_stream(HttpMethod method, std::string_view path,
+                    StreamHandlerFn stream) noexcept {
+        if (count_ >= MaxRoutes) return false;
+        routes_[count_++] = { method, path, nullptr, stream };
         return true;
     }
 
@@ -551,6 +610,17 @@ struct ParseState {
     bool   headers_too_large { false };
     bool   body_too_large    { false };
 
+    // Streaming body / OTA (requirement #7). A type-erased resolver, set by the
+    // engine (which knows RouteTable<MaxRoutes>), looks up the matched route at
+    // on_headers_complete. If it is a streaming route, body chunks are pushed
+    // straight to the handler from on_body instead of being accumulated.
+    using StreamResolveFn = StreamHandlerFn (*)(void* ctx, HttpRequest& req) noexcept;
+    StreamResolveFn stream_resolve { nullptr };
+    void*           stream_ctx     { nullptr };
+    StreamHandlerFn stream_handler { nullptr };   // active streaming handler
+    HttpResponse*   stream_response { nullptr };  // response bound for streaming
+    size_t          stream_offset  { 0 };
+
     void reset() noexcept;
     void commit_header() noexcept;
 };
@@ -607,6 +677,13 @@ public:
         // the head of the next does not clobber the current request's state.
         llhttp_reset(&parser_);
 
+        // Wire the streaming-body resolver (requirement #7). The resolver is a
+        // static trampoline templated on MaxRoutes, so the non-template parser
+        // callbacks can look up a route without knowing the table's capacity.
+        state_.stream_resolve = &stream_resolve_trampoline<MaxRoutes>;
+        state_.stream_ctx     = const_cast<RouteTable<MaxRoutes>*>(&routes);
+        state_.stream_response = &response_;
+
         bool   handled_any = false;
         size_t buffered    = 0;   // valid bytes currently in rx_buf_
 
@@ -614,6 +691,13 @@ public:
         // same socket until the client/engine decides to close it.
         while (true) {
             state_.reset();
+
+            // Bind the response up front so a streaming-body handler invoked
+            // from the parser (requirement #7) already has a usable response
+            // with a raw writer over this socket.
+            response_.bind(std::span<char>(tx_buf_.data(), tx_buf_.size()));
+            response_.reset();
+            response_.bind_stream(&raw_write_trampoline, &socket_);
 
             // --- read + parse exactly one complete request -----------------
             size_t consumed = 0;   // bytes of rx_buf_ consumed by this request
@@ -686,12 +770,19 @@ public:
 
             // --- dispatch --------------------------------------------------
             const bool keep = state_.request.keep_alive;
-
-            response_.bind(std::span<char>(tx_buf_.data(), tx_buf_.size()));
-            response_.reset();
             response_.set_keep_alive(keep);
 
-            if (state_.request.method == HttpMethod::UNKNOWN) {
+            if (state_.stream_handler) {
+                // Streaming body route (requirement #7): the handler already
+                // received every chunk during parsing (incl. the final last=true
+                // call). If it streamed its own reply it set hijacked_; otherwise
+                // the engine sends a default 200 acknowledgement.
+                if (!response_.hijacked()) {
+                    if (response_.status() == 200 && response_.body().empty())
+                        response_.set_body("OK");
+                    (void)response_.send(socket_);
+                }
+            } else if (state_.request.method == HttpMethod::UNKNOWN) {
                 // Parser accepted the syntax but the method is one we do not
                 // implement (e.g. TRACE/CONNECT) -> 501 Not Implemented.
                 send_error(501, "Not Implemented", keep);
@@ -703,7 +794,7 @@ public:
                     MiddlewareChain chain(middleware, middleware_count,
                                           route->handler);
                     chain.run(state_.request, response_);
-                    (void)response_.send(socket_);
+                    (void)response_.send(socket_);   // no-op if handler hijacked
                 } else if (routes.path_exists(state_.request.path)) {
                     send_error(405, "Method Not Allowed", keep);
                 } else {
@@ -744,6 +835,25 @@ private:
         response_.reset();
         response_.set_keep_alive(keep);
         response_.send(socket_, code, msg, "text/plain");
+    }
+
+    // Type-erased raw writer used by HttpResponse for streaming/SSE. Recovers
+    // the concrete Socket from the context pointer — no virtuals.
+    static int raw_write_trampoline(void* ctx, const uint8_t* data,
+                                    size_t len) noexcept {
+        auto* sock = static_cast<Socket*>(ctx);
+        return sock->write(std::span<const uint8_t>(data, len));
+    }
+
+    // Type-erased streaming-route resolver (requirement #7). Templated on the
+    // route-table capacity so the non-template parser callbacks can look up a
+    // route; returns the matched route's streaming handler, or nullptr.
+    template <size_t MaxRoutes>
+    static StreamHandlerFn stream_resolve_trampoline(void* ctx,
+                                                     HttpRequest& req) noexcept {
+        auto* routes = static_cast<const RouteTable<MaxRoutes>*>(ctx);
+        const Route* r = routes->find(req.method, req.path, req);
+        return (r && r->stream) ? r->stream : nullptr;
     }
 };
 
@@ -860,6 +970,15 @@ public:
     bool patch  (std::string_view path, HandlerFn h) noexcept { return add_route(HttpMethod::PATCH,   path, h); }
     bool head   (std::string_view path, HandlerFn h) noexcept { return add_route(HttpMethod::HEAD,    path, h); }
     bool options(std::string_view path, HandlerFn h) noexcept { return add_route(HttpMethod::OPTIONS, path, h); }
+
+    // Streaming body routes (requirement #7, OTA). The handler receives body
+    // chunks as they arrive without the engine buffering the full payload.
+    bool post_stream(std::string_view path, StreamHandlerFn h) noexcept {
+        return routes_.add_stream(HttpMethod::POST, path, h);
+    }
+    bool put_stream(std::string_view path, StreamHandlerFn h) noexcept {
+        return routes_.add_stream(HttpMethod::PUT, path, h);
+    }
 
     template <typename Acceptor>
         requires AcceptorConcept<Acceptor, Socket>

@@ -132,6 +132,75 @@ std::string_view HttpResponse::content_type() const noexcept {
     return content_type_;
 }
 
+// --- Streaming / SSE (requirement #7) --------------------------------------
+
+void HttpResponse::bind_stream(RawWriteFn fn, void* ctx) noexcept {
+    stream_write_ = fn;
+    stream_ctx_   = ctx;
+}
+
+int HttpResponse::write_raw(std::span<const uint8_t> data) noexcept {
+    if (!stream_write_) return -1;
+    hijacked_ = true;              // handler owns the response from now on
+    sent_     = true;              // suppress the engine's buffered send()
+    return stream_write_(stream_ctx_, data.data(), data.size());
+}
+
+int HttpResponse::write_raw(std::string_view s) noexcept {
+    return write_raw(std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(s.data()), s.size()));
+}
+
+bool HttpResponse::hijacked() const noexcept {
+    return hijacked_;
+}
+
+bool HttpResponse::begin_sse() noexcept {
+    if (!stream_write_) return false;
+    static constexpr std::string_view head =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/event-stream\r\n"
+        "Cache-Control: no-cache\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n";
+    return write_raw(head) >= 0;
+}
+
+bool HttpResponse::send_event(std::string_view data,
+                              std::string_view event,
+                              std::string_view id) noexcept {
+    if (!stream_write_) return false;
+
+    // Build the frame in a small stack buffer. Fields:
+    //   [id: <id>\n] [event: <event>\n] data: <line>\n (repeated) \n
+    char   frame[512];
+    size_t n = 0;
+    auto put = [&](std::string_view s) noexcept {
+        size_t c = s.size();
+        if (n + c > sizeof(frame)) c = sizeof(frame) - n;
+        __builtin_memcpy(frame + n, s.data(), c);
+        n += c;
+    };
+
+    if (!id.empty())    { put("id: ");    put(id);    put("\n"); }
+    if (!event.empty()) { put("event: "); put(event); put("\n"); }
+
+    // Split data on '\n' into multiple "data:" lines per the SSE spec.
+    size_t start = 0;
+    while (start <= data.size()) {
+        size_t nl = data.find('\n', start);
+        std::string_view line = (nl == std::string_view::npos)
+            ? data.substr(start)
+            : data.substr(start, nl - start);
+        put("data: "); put(line); put("\n");
+        if (nl == std::string_view::npos) break;
+        start = nl + 1;
+    }
+    put("\n");   // blank line terminates the event
+
+    return write_raw(std::string_view(frame, n)) >= 0;
+}
+
 void HttpResponse::reset() noexcept {
     len_              = 0;
     sent_             = false;
@@ -142,6 +211,9 @@ void HttpResponse::reset() noexcept {
     body_             = {};
     keep_alive_       = false;
     hdr_count_        = 0;
+    hijacked_         = false;
+    // stream_write_/stream_ctx_ are bound per-connection and intentionally
+    // preserved across keep-alive requests.
 }
 
 std::string_view HttpResponse::formatted() const noexcept {
@@ -235,6 +307,10 @@ void ParseState::reset() noexcept {
     body_bytes        = 0;
     headers_too_large = false;
     body_too_large    = false;
+    stream_handler    = nullptr;
+    stream_offset     = 0;
+    // stream_resolve/stream_ctx/stream_response are bound per-connection and
+    // preserved across keep-alive requests.
 }
 
 void ParseState::commit_header() noexcept {
@@ -327,11 +403,30 @@ static int cb_on_headers_complete(llhttp_t* p) noexcept {
     } else {
         s->request.raw_query = {};
     }
+
+    // Streaming body / OTA (requirement #7): resolve the route now so the
+    // engine can push body chunks to a streaming handler instead of buffering.
+    if (s->stream_resolve) {
+        s->stream_handler = s->stream_resolve(s->stream_ctx, s->request);
+    }
     return HPE_OK;
 }
 
 static int cb_on_body(llhttp_t* p, const char* at, size_t len) noexcept {
     auto* s = static_cast<ParseState*>(p->data);
+
+    // Streaming body / OTA (requirement #7): push this chunk straight to the
+    // handler (e.g. a flash writer) without buffering or size-capping — the
+    // payload may be far larger than the RX buffer or UCHTTP_MAX_BODY_BYTES.
+    if (s->stream_handler) {
+        std::span<const uint8_t> chunk(
+            reinterpret_cast<const uint8_t*>(at), len);
+        s->stream_handler(s->request, *s->stream_response, chunk,
+                          s->stream_offset, /*last=*/false);
+        s->stream_offset += len;
+        return HPE_OK;
+    }
+
     s->body_bytes += len;
     if (s->body_bytes > UCHTTP_MAX_BODY_BYTES) {
         s->body_too_large = true;
@@ -363,6 +458,15 @@ static int cb_on_message_complete(llhttp_t* p) noexcept {
     // Connection lifecycle (requirement #3): llhttp evaluates HTTP version +
     // Connection header to decide whether the socket may be reused.
     s->request.keep_alive = llhttp_should_keep_alive(p) != 0;
+
+    // Streaming body / OTA (requirement #7): signal end-of-body to the handler
+    // with an empty final chunk so it can finalise (flush flash, verify CRC).
+    if (s->stream_handler) {
+        s->stream_handler(s->request, *s->stream_response,
+                          std::span<const uint8_t>{}, s->stream_offset,
+                          /*last=*/true);
+    }
+
     // Pause so that a single read() carrying the tail of this request AND the
     // head of the next (keep-alive / pipelining) does not overwrite the
     // current request's state. The engine resumes after dispatching.
