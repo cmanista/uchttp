@@ -31,6 +31,10 @@ public:
     int  write(std::span<const uint8_t> buf) noexcept;
     void close() noexcept;
 
+    // Slowloris protection (requirement #4): drop the connection if the peer
+    // stalls for longer than `ms` between reads. 0 disables the timeout.
+    bool set_read_timeout(unsigned ms) noexcept;
+
     bool is_valid() const noexcept;
     int  fd()       const noexcept;
 

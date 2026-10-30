@@ -16,6 +16,8 @@
 #include <cstring>
 
 #include "uchttp.h"
+#include "uchttp_security.h"
+#include "uchttp_tls.h"
 #include "mock_socket.h"
 
 using namespace uchttp;
@@ -1373,4 +1375,298 @@ TEST(CoreHeadersTest, ResponseDefaultsToConnectionClose) {
     MockSocket sock;
     res.send(sock, 200, "x");
     EXPECT_EQ(header_value(sock.tx_string(), "Connection"), "close");
+}
+
+// ===========================================================================
+// Requirement #4 — security: secure_compare, auth, headers, DoS limits, TLS
+// ===========================================================================
+
+// --- secure_compare --------------------------------------------------------
+
+TEST(SecurityTest, SecureCompareEqual) {
+    EXPECT_TRUE(security::secure_compare("s3cr3t", "s3cr3t"));
+    EXPECT_TRUE(security::secure_compare("", ""));
+}
+
+TEST(SecurityTest, SecureCompareDifferentContent) {
+    EXPECT_FALSE(security::secure_compare("s3cr3t", "s3cr3T"));
+    EXPECT_FALSE(security::secure_compare("abc", "abd"));
+}
+
+TEST(SecurityTest, SecureCompareDifferentLength) {
+    EXPECT_FALSE(security::secure_compare("abc", "abcd"));
+    EXPECT_FALSE(security::secure_compare("abcd", "abc"));
+    EXPECT_FALSE(security::secure_compare("secret", ""));
+}
+
+// --- API key auth middleware -----------------------------------------------
+
+TEST(SecurityTest, ApiKeyAuthAcceptsValidKey) {
+    security::set_api_key("letmein");
+    RouteTable<8> rt;
+    static bool handler_ran = false;
+    rt.add(HttpMethod::GET, "/p", [](const HttpRequest&, HttpResponse& res) {
+        handler_ran = true; res.set_status(200); res.set_body("ok");
+    });
+    MiddlewareFn mws[] = { security::api_key_auth };
+
+    handler_ran = false;
+    const std::string raw =
+        "GET /p HTTP/1.1\r\nHost: x\r\nX-API-Key: letmein\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt, mws, 1);
+
+    EXPECT_TRUE(handler_ran);
+    EXPECT_EQ(parse_status_code(tx), 200);
+}
+
+TEST(SecurityTest, ApiKeyAuthRejectsWrongKey) {
+    security::set_api_key("letmein");
+    RouteTable<8> rt;
+    static bool handler_ran = false;
+    rt.add(HttpMethod::GET, "/p", [](const HttpRequest&, HttpResponse& res) {
+        handler_ran = true; res.set_status(200);
+    });
+    MiddlewareFn mws[] = { security::api_key_auth };
+
+    handler_ran = false;
+    const std::string raw =
+        "GET /p HTTP/1.1\r\nHost: x\r\nX-API-Key: wrong\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt, mws, 1);
+
+    EXPECT_FALSE(handler_ran);                 // short-circuited
+    EXPECT_EQ(parse_status_code(tx), 401);
+}
+
+TEST(SecurityTest, ApiKeyAuthRejectsMissingKey) {
+    security::set_api_key("letmein");
+    RouteTable<8> rt;
+    rt.add(HttpMethod::GET, "/p", [](const HttpRequest&, HttpResponse& res) {
+        res.set_status(200);
+    });
+    MiddlewareFn mws[] = { security::api_key_auth };
+
+    const std::string raw = "GET /p HTTP/1.1\r\nHost: x\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt, mws, 1);
+
+    EXPECT_EQ(parse_status_code(tx), 401);
+}
+
+TEST(SecurityTest, ApiKeyAuthFailsClosedWhenUnconfigured) {
+    security::set_api_key("");          // no key configured
+    RouteTable<8> rt;
+    rt.add(HttpMethod::GET, "/p", [](const HttpRequest&, HttpResponse& res) {
+        res.set_status(200);
+    });
+    MiddlewareFn mws[] = { security::api_key_auth };
+
+    // Even sending some key must be rejected (fail closed).
+    const std::string raw =
+        "GET /p HTTP/1.1\r\nHost: x\r\nX-API-Key: anything\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt, mws, 1);
+
+    EXPECT_EQ(parse_status_code(tx), 401);
+    security::set_api_key("letmein");   // restore for other tests
+}
+
+// --- Bearer auth middleware ------------------------------------------------
+
+TEST(SecurityTest, BearerAuthAcceptsValidToken) {
+    security::set_bearer_token("tok-123");
+    RouteTable<8> rt;
+    static bool handler_ran = false;
+    rt.add(HttpMethod::GET, "/b", [](const HttpRequest&, HttpResponse& res) {
+        handler_ran = true; res.set_status(200);
+    });
+    MiddlewareFn mws[] = { security::bearer_auth };
+
+    handler_ran = false;
+    const std::string raw =
+        "GET /b HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer tok-123\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt, mws, 1);
+
+    EXPECT_TRUE(handler_ran);
+    EXPECT_EQ(parse_status_code(tx), 200);
+}
+
+TEST(SecurityTest, BearerAuthRejectsWrongToken) {
+    security::set_bearer_token("tok-123");
+    RouteTable<8> rt;
+    rt.add(HttpMethod::GET, "/b", [](const HttpRequest&, HttpResponse& res) {
+        res.set_status(200);
+    });
+    MiddlewareFn mws[] = { security::bearer_auth };
+
+    const std::string raw =
+        "GET /b HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer nope\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt, mws, 1);
+
+    EXPECT_EQ(parse_status_code(tx), 401);
+    EXPECT_EQ(header_value(tx, "WWW-Authenticate"), "Bearer");
+}
+
+TEST(SecurityTest, BearerAuthRejectsMissingScheme) {
+    security::set_bearer_token("tok-123");
+    RouteTable<8> rt;
+    rt.add(HttpMethod::GET, "/b", [](const HttpRequest&, HttpResponse& res) {
+        res.set_status(200);
+    });
+    MiddlewareFn mws[] = { security::bearer_auth };
+
+    // Token sent without the "Bearer " scheme -> rejected.
+    const std::string raw =
+        "GET /b HTTP/1.1\r\nHost: x\r\nAuthorization: tok-123\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt, mws, 1);
+
+    EXPECT_EQ(parse_status_code(tx), 401);
+}
+
+// --- Security-headers middleware -------------------------------------------
+
+TEST(SecurityTest, SecurityHeadersInjected) {
+    RouteTable<8> rt;
+    rt.add(HttpMethod::GET, "/d", [](const HttpRequest&, HttpResponse& res) {
+        res.set_status(200); res.set_body("{}");
+    });
+    MiddlewareFn mws[] = { security::security_headers };
+
+    const std::string raw = "GET /d HTTP/1.1\r\nHost: x\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt, mws, 1);
+
+    EXPECT_EQ(header_value(tx, "X-Content-Type-Options"), "nosniff");
+    EXPECT_EQ(header_value(tx, "X-Frame-Options"), "DENY");
+    EXPECT_EQ(header_value(tx, "Access-Control-Allow-Origin"), "*");
+    EXPECT_EQ(header_value(tx, "Content-Security-Policy"), "default-src 'self'");
+}
+
+TEST(SecurityTest, SecurityHeadersConfigurable) {
+    security::set_cors_origin("https://app.example");
+    security::set_csp("default-src 'none'");
+    RouteTable<8> rt;
+    rt.add(HttpMethod::GET, "/d", [](const HttpRequest&, HttpResponse& res) {
+        res.set_status(200);
+    });
+    MiddlewareFn mws[] = { security::security_headers };
+
+    const std::string raw = "GET /d HTTP/1.1\r\nHost: x\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt, mws, 1);
+
+    EXPECT_EQ(header_value(tx, "Access-Control-Allow-Origin"), "https://app.example");
+    EXPECT_EQ(header_value(tx, "Content-Security-Policy"), "default-src 'none'");
+    // Restore defaults for any later test.
+    security::set_cors_origin("*");
+    security::set_csp("default-src 'self'");
+}
+
+// --- DoS protection: oversize header / body --------------------------------
+
+TEST(SecurityTest, OversizeHeadersRejectedWith431) {
+    RouteTable<8> rt;
+    rt.add(HttpMethod::GET, "/x", [](const HttpRequest&, HttpResponse& res) {
+        res.set_status(200);
+    });
+
+    // One header value far beyond UCHTTP_MAX_HEADER_BYTES (2048).
+    std::string big(4000, 'A');
+    const std::string raw =
+        "GET /x HTTP/1.1\r\nHost: x\r\nX-Big: " + big + "\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket, 8192> conn(std::move(sock));
+    conn.process(rt);
+
+    EXPECT_EQ(parse_status_code(tx), 431);
+}
+
+TEST(SecurityTest, OversizeBodyRejectedWith413) {
+    RouteTable<8> rt;
+    rt.add(HttpMethod::POST, "/x", [](const HttpRequest&, HttpResponse& res) {
+        res.set_status(200);
+    });
+
+    // Body beyond UCHTTP_MAX_BODY_BYTES (4096).
+    std::string body(5000, 'B');
+    const std::string raw =
+        "POST /x HTTP/1.1\r\nHost: x\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket, 8192> conn(std::move(sock));
+    conn.process(rt);
+
+    EXPECT_EQ(parse_status_code(tx), 413);
+}
+
+// --- TLS abstraction: TlsSocket<Session> satisfies SocketConcept -----------
+
+namespace {
+// Minimal in-memory TLS session satisfying TlsSessionConcept, so we can verify
+// the abstraction compiles and TlsSocket models SocketConcept without needing
+// a real crypto library linked into the unit tests.
+class FakeTlsSession {
+public:
+    FakeTlsSession() = default;
+    bool handshake() noexcept { handshaken_ = true; return true; }
+    int  read(std::span<uint8_t>) noexcept { return 0; }
+    int  write(std::span<const uint8_t> b) noexcept {
+        return static_cast<int>(b.size());
+    }
+    void shutdown() noexcept { valid_ = false; }
+    bool is_valid() const noexcept { return valid_; }
+    bool set_read_timeout(unsigned) noexcept { return true; }
+private:
+    bool handshaken_ { false };
+    bool valid_      { true };
+};
+} // namespace
+
+static_assert(TlsSessionConcept<FakeTlsSession>,
+              "FakeTlsSession must satisfy TlsSessionConcept");
+static_assert(SocketConcept<TlsSocket<FakeTlsSession>>,
+              "TlsSocket must satisfy SocketConcept");
+
+TEST(TlsTest, TlsSocketModelsSocketConcept) {
+    TlsSocket<FakeTlsSession> sock{ FakeTlsSession{} };
+    EXPECT_TRUE(sock.is_valid());
+    // Lazy handshake on first write, then data passes through.
+    const uint8_t data[] = { 'h', 'i' };
+    EXPECT_EQ(sock.write(std::span<const uint8_t>(data, 2)), 2);
+    EXPECT_TRUE(sock.set_read_timeout(1000));
+    sock.close();
+    EXPECT_FALSE(sock.is_valid());
+}
+
+TEST(TlsTest, TlsServerTypeCompiles) {
+    // The whole engine must instantiate over a TLS socket type unchanged.
+    using TlsSock = TlsSocket<FakeTlsSession>;
+    HttpServer<TlsSock> server;
+    auto h = [](const HttpRequest&, HttpResponse&) {};
+    EXPECT_TRUE(server.get("/secure", h));
+    EXPECT_EQ(server.routes().size(), 1u);
 }

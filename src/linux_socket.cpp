@@ -2,10 +2,13 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <cstdio>
+
+#include "uchttp.h"   // UCHTTP_IDLE_TIMEOUT_MS
 
 namespace uchttp {
 
@@ -49,6 +52,14 @@ void LinuxSocket::close() noexcept {
         ::close(fd_);
         fd_ = INVALID_FD;
     }
+}
+
+bool LinuxSocket::set_read_timeout(unsigned ms) noexcept {
+    if (fd_ == INVALID_FD) return false;
+    timeval tv{};
+    tv.tv_sec  = static_cast<time_t>(ms / 1000);
+    tv.tv_usec = static_cast<suseconds_t>((ms % 1000) * 1000);
+    return ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0;
 }
 
 bool LinuxSocket::is_valid() const noexcept { return fd_ != INVALID_FD; }
@@ -95,7 +106,12 @@ LinuxSocket LinuxAcceptor::accept() noexcept {
     socklen_t   len = sizeof(client);
     int cfd = ::accept(listen_fd_,
                        reinterpret_cast<sockaddr*>(&client), &len);
-    return LinuxSocket(cfd);
+    LinuxSocket sock(cfd);
+    // Slowloris protection (requirement #4): bound the time a client may stall.
+    if (sock.is_valid() && UCHTTP_IDLE_TIMEOUT_MS > 0) {
+        sock.set_read_timeout(UCHTTP_IDLE_TIMEOUT_MS);
+    }
+    return sock;
 }
 
 bool LinuxAcceptor::is_running() const noexcept { return running_; }

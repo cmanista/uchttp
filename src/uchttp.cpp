@@ -146,6 +146,8 @@ const char* HttpResponse::default_reason(int code) noexcept {
         case 403: return "Forbidden";
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
+        case 413: return "Content Too Large";
+        case 431: return "Request Header Fields Too Large";
         case 500: return "Internal Server Error";
         case 501: return "Not Implemented";
         default:  return "Unknown";
@@ -217,6 +219,10 @@ void ParseState::reset() noexcept {
     in_header_value  = false;
     message_complete = false;
     parse_error      = false;
+    header_bytes      = 0;
+    body_bytes        = 0;
+    headers_too_large = false;
+    body_too_large    = false;
 }
 
 void ParseState::commit_header() noexcept {
@@ -238,6 +244,11 @@ void ParseState::commit_header() noexcept {
 
 static int cb_on_url(llhttp_t* p, const char* at, size_t len) noexcept {
     auto* s = static_cast<ParseState*>(p->data);
+    s->header_bytes += len;
+    if (s->header_bytes > UCHTTP_MAX_HEADER_BYTES) {
+        s->headers_too_large = true;
+        return HPE_USER;   // stop parsing; engine replies 431
+    }
     if (s->request.path.empty()) {
         s->request.path = { at, len };
     } else {
@@ -249,6 +260,11 @@ static int cb_on_url(llhttp_t* p, const char* at, size_t len) noexcept {
 
 static int cb_on_header_field(llhttp_t* p, const char* at, size_t len) noexcept {
     auto* s = static_cast<ParseState*>(p->data);
+    s->header_bytes += len;
+    if (s->header_bytes > UCHTTP_MAX_HEADER_BYTES) {
+        s->headers_too_large = true;
+        return HPE_USER;
+    }
     if (s->in_header_value) {
         s->commit_header();
     }
@@ -263,6 +279,11 @@ static int cb_on_header_field(llhttp_t* p, const char* at, size_t len) noexcept 
 
 static int cb_on_header_value(llhttp_t* p, const char* at, size_t len) noexcept {
     auto* s = static_cast<ParseState*>(p->data);
+    s->header_bytes += len;
+    if (s->header_bytes > UCHTTP_MAX_HEADER_BYTES) {
+        s->headers_too_large = true;
+        return HPE_USER;
+    }
     s->in_header_value = true;
     if (!s->hdr_value_start) {
         s->hdr_value_start = at;
@@ -299,6 +320,11 @@ static int cb_on_headers_complete(llhttp_t* p) noexcept {
 
 static int cb_on_body(llhttp_t* p, const char* at, size_t len) noexcept {
     auto* s = static_cast<ParseState*>(p->data);
+    s->body_bytes += len;
+    if (s->body_bytes > UCHTTP_MAX_BODY_BYTES) {
+        s->body_too_large = true;
+        return HPE_USER;   // stop parsing; engine replies 413
+    }
     if (s->request.body.empty()) {
         // First fragment: body starts where llhttp points into the RX buffer.
         s->request.body = { at, len };

@@ -31,6 +31,21 @@
 #  define UCHTTP_TX_BUFFER_SIZE 1024
 #endif
 
+// --- DoS / Slowloris protection (requirement #4) ---------------------------
+// Maximum bytes accepted for the request header block and the request body.
+// They guard the fixed-size RX buffer against overflow / resource exhaustion.
+#ifndef UCHTTP_MAX_HEADER_BYTES
+#  define UCHTTP_MAX_HEADER_BYTES 2048
+#endif
+#ifndef UCHTTP_MAX_BODY_BYTES
+#  define UCHTTP_MAX_BODY_BYTES   4096
+#endif
+// Idle read timeout (milliseconds) for a connection; 0 disables it. Enforced by
+// sockets that implement set_read_timeout(); see LinuxSocket.
+#ifndef UCHTTP_IDLE_TIMEOUT_MS
+#  define UCHTTP_IDLE_TIMEOUT_MS  5000
+#endif
+
 namespace uchttp {
 
 // ---------------------------------------------------------------------------
@@ -519,6 +534,13 @@ struct ParseState {
     bool message_complete { false };
     bool parse_error      { false };
 
+    // DoS protection (requirement #4): byte counters and oversize flags filled
+    // by the parser callbacks; the engine turns them into 431 / 413 responses.
+    size_t header_bytes   { 0 };
+    size_t body_bytes     { 0 };
+    bool   headers_too_large { false };
+    bool   body_too_large    { false };
+
     void reset() noexcept;
     void commit_header() noexcept;
 };
@@ -616,6 +638,15 @@ public:
                 buffered += static_cast<size_t>(n);
             }
 
+            if (state_.headers_too_large) {
+                // DoS protection (requirement #4): header block too large.
+                send_error(431, "Request Header Fields Too Large", false);
+                return handled_any;
+            }
+            if (state_.body_too_large) {
+                send_error(413, "Content Too Large", false);
+                return handled_any;
+            }
             if (state_.parse_error) {
                 // Malformed syntax: engine answers 400 before any middleware.
                 send_error(400, "Bad Request", false);
