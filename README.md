@@ -218,6 +218,27 @@ Middleware run in registration order; two registered as `A` then `B` wrap the
 handler as `A → B → handler → B → A`. The table is a fixed-size array sized by
 the `UCHTTP_MAX_MIDDLEWARE` compile-time constant (default 8).
 
+### Bundled application middleware
+
+`#include "uchttp_app_middleware.h"` — optional, opt-in middleware for the
+headers that belong to the application layer (requirement #5):
+
+```cpp
+server.use(uchttp::app::request_id);          // echo/generate X-Request-ID
+uchttp::app::set_cache_control("public, max-age=60");
+server.use(uchttp::app::cache_control);       // Cache-Control on every response
+server.use(uchttp::app::etag);                // ETag + If-None-Match -> 304
+```
+
+| Middleware | Header(s) | Behaviour |
+|---|---|---|
+| `cache_control` | `Cache-Control` | Injects the configured value (`set_cache_control`) |
+| `etag` | `ETag`, `If-None-Match` | FNV-1a of the body; matching `If-None-Match` ⇒ `304 Not Modified` with an empty body |
+| `request_id` | `X-Request-ID` | Echoes an incoming id or generates one for log correlation |
+| `client_accepts_encoding()` | `Accept-Encoding` | Helper to negotiate compression in a handler |
+
+(Auth and security-header middleware live in `uchttp_security.h`; see below.)
+
 ## Protocol headers handled by the engine
 
 Some headers are owned by the server core, never by middleware, because they
@@ -333,6 +354,31 @@ curl -k https://localhost:8443/api/hello
 LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu ./build/uchttp_tests
 ```
 
+## Reliability & resource management
+
+On an MCU the socket/descriptor pool is tiny, so uchttp never allocates a
+connection on demand (requirement #6):
+
+- **Connection pool** — `HttpServer` owns a `ConnectionPool<Socket, N, ...>`: a
+  fixed, pre-allocated array of `N` connection slots (`UCHTTP_MAX_CONNECTIONS`,
+  default 4), each with its own RX/TX buffers and parser state. `run()` acquires
+  an idle slot per client and releases it when done. When the pool is exhausted
+  the new connection is dropped rather than growing the heap.
+- **Timeouts** — the keep-alive loop (requirement #3) plus the idle read timeout
+  (`UCHTTP_IDLE_TIMEOUT_MS`, requirement #4) reclaim slots held by dead/stalled
+  peers.
+- **Graceful shutdown** — `server.stop()` ends the accept loop and
+  `server.shutdown()` (or `ConnectionPool::close_all()`) closes every active
+  slot cleanly, e.g. on a network-stack reset or reboot.
+
+```cpp
+uchttp::HttpServer<MySocket> server;   // pool sized by UCHTTP_MAX_CONNECTIONS
+server.run(acceptor);                  // acquire/serve/release per client
+// from a signal handler / supervisor task:
+server.stop();                         // leave run()
+server.shutdown();                     // close all active connections
+```
+
 ## Porting to an RTOS / bare-metal target
 
 1. Implement `read()`, `write()`, `close()`, and `is_valid()` for your TCP stack (lwIP, Zephyr BSD sockets, etc.).
@@ -344,8 +390,9 @@ No other changes are needed — the core library has no OS dependencies.
 ## File map
 
 ```
-include/uchttp.h          Core library (engine, routing, middleware)
+include/uchttp.h          Core library (engine, routing, middleware, pool)
 include/uchttp_security.h Auth + security-headers middleware, secure_compare
+include/uchttp_app_middleware.h  Cache-Control / ETag / Accept-Encoding / X-Request-ID
 include/uchttp_tls.h      TLS abstraction (TlsSocket / TlsAcceptor)
 include/openssl_tls.h     OpenSSL backend (host)
 include/wolfssl_tls.h     wolfSSL backend (embedded)
@@ -353,7 +400,7 @@ src/linux_socket.h        POSIX LinuxSocket + LinuxAcceptor
 src/linux_server.cpp      Example HTTP server on localhost
 src/linux_https_server.cpp Example HTTPS server (OpenSSL)
 tests/mock_socket.h       In-memory socket for unit tests
-tests/test_uchttp.cpp     89 gtest unit tests
+tests/test_uchttp.cpp     101 gtest unit tests
 CMakeLists.txt            Build system
 third_party/llhttp/       llhttp v9.4.3
 ```

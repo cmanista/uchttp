@@ -24,6 +24,10 @@
 #ifndef UCHTTP_MAX_MIDDLEWARE
 #  define UCHTTP_MAX_MIDDLEWARE 8
 #endif
+// Connection pool size (requirement #6): max simultaneously served clients.
+#ifndef UCHTTP_MAX_CONNECTIONS
+#  define UCHTTP_MAX_CONNECTIONS 4
+#endif
 #ifndef UCHTTP_RX_BUFFER_SIZE
 #  define UCHTTP_RX_BUFFER_SIZE 1024
 #endif
@@ -256,6 +260,12 @@ public:
     // matching "Connection: keep-alive" / "Connection: close" header.
     void set_keep_alive(bool v) noexcept;
     bool keep_alive() const noexcept;
+
+    // Read-back accessors (used by response middleware, e.g. ETag/304).
+    // Defined in uchttp.cpp.
+    int              status() const noexcept;
+    std::string_view body()  const noexcept;
+    std::string_view content_type() const noexcept;
 
     void reset() noexcept;
 
@@ -568,6 +578,21 @@ public:
         parser_.data = &state_;
     }
 
+    // Default-constructed, idle connection — used by ConnectionPool, which
+    // pre-allocates the slots once and assigns a socket per client.
+    HttpConnection() noexcept {
+        llhttp_init(&parser_, HTTP_REQUEST, &make_llhttp_settings());
+        parser_.data = &state_;
+    }
+
+    // Rebind this (pooled) connection to a freshly accepted socket.
+    void assign(Socket socket) noexcept {
+        socket_ = static_cast<Socket&&>(socket);
+        llhttp_reset(&parser_);
+    }
+
+    bool is_valid() const noexcept { return socket_.is_valid(); }
+
     HttpConnection(const HttpConnection&)            = delete;
     HttpConnection& operator=(const HttpConnection&) = delete;
     HttpConnection(HttpConnection&&)                 = default;
@@ -723,6 +748,75 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// ConnectionPool  – fixed, pre-allocated array of connection slots
+// (requirement #6). No heap: all slots, their RX/TX buffers and parser state
+// are allocated once up front. acquire() hands out an idle slot (or nullptr
+// when the pool is exhausted), release() returns one, and close_all() performs
+// a graceful shutdown of every active slot (e.g. on stack reset / reboot).
+// ---------------------------------------------------------------------------
+
+template <SocketConcept Socket,
+          size_t MaxConns = UCHTTP_MAX_CONNECTIONS,
+          size_t RxSize   = UCHTTP_RX_BUFFER_SIZE,
+          size_t TxSize   = UCHTTP_TX_BUFFER_SIZE>
+class ConnectionPool {
+public:
+    using Connection = HttpConnection<Socket, RxSize, TxSize>;
+
+    ConnectionPool() = default;
+    ConnectionPool(const ConnectionPool&)            = delete;
+    ConnectionPool& operator=(const ConnectionPool&) = delete;
+
+    static constexpr size_t capacity() noexcept { return MaxConns; }
+    size_t active() const noexcept { return active_; }
+    bool   full()   const noexcept { return active_ >= MaxConns; }
+
+    // Grab an idle slot and bind `sock` to it. Returns nullptr if the pool is
+    // exhausted (caller should drop/refuse the connection).
+    Connection* acquire(Socket&& sock) noexcept {
+        for (size_t i = 0; i < MaxConns; ++i) {
+            if (!in_use_[i]) {
+                in_use_[i] = true;
+                ++active_;
+                slots_[i].assign(static_cast<Socket&&>(sock));
+                return &slots_[i];
+            }
+        }
+        return nullptr;
+    }
+
+    // Close the slot's socket and return it to the pool.
+    void release(Connection* conn) noexcept {
+        for (size_t i = 0; i < MaxConns; ++i) {
+            if (&slots_[i] == conn) {
+                if (in_use_[i]) {
+                    slots_[i].close();
+                    in_use_[i] = false;
+                    --active_;
+                }
+                return;
+            }
+        }
+    }
+
+    // Graceful shutdown: close every active connection and free all slots.
+    void close_all() noexcept {
+        for (size_t i = 0; i < MaxConns; ++i) {
+            if (in_use_[i]) {
+                slots_[i].close();
+                in_use_[i] = false;
+            }
+        }
+        active_ = 0;
+    }
+
+private:
+    Connection slots_[MaxConns] {};
+    bool       in_use_[MaxConns] {};
+    size_t     active_ { 0 };
+};
+
+// ---------------------------------------------------------------------------
 // AcceptorConcept
 // ---------------------------------------------------------------------------
 
@@ -740,7 +834,8 @@ template <SocketConcept Socket,
           size_t MaxRoutes = UCHTTP_MAX_ROUTES,
           size_t RxSize    = UCHTTP_RX_BUFFER_SIZE,
           size_t TxSize    = UCHTTP_TX_BUFFER_SIZE,
-          size_t MaxMiddleware = UCHTTP_MAX_MIDDLEWARE>
+          size_t MaxMiddleware = UCHTTP_MAX_MIDDLEWARE,
+          size_t MaxConns      = UCHTTP_MAX_CONNECTIONS>
 class HttpServer {
 public:
     HttpServer() = default;
@@ -769,14 +864,23 @@ public:
     template <typename Acceptor>
         requires AcceptorConcept<Acceptor, Socket>
     void run(Acceptor& acceptor) noexcept {
-        while (acceptor.is_running()) {
+        running_ = true;
+        while (acceptor.is_running() && running_) {
             Socket sock = acceptor.accept();
             if (!sock.is_valid()) continue;
 
-            HttpConnection<Socket, RxSize, TxSize> conn(static_cast<Socket&&>(sock));
-            conn.process(routes_, middleware_, mw_count_);
-            conn.close();
+            // Acquire a pre-allocated slot from the fixed pool (requirement #6).
+            auto* conn = pool_.acquire(static_cast<Socket&&>(sock));
+            if (!conn) {
+                // Pool exhausted: refuse rather than allocate. The socket is
+                // dropped (closed by its destructor) so the client backs off.
+                continue;
+            }
+            conn->process(routes_, middleware_, mw_count_);
+            pool_.release(conn);
         }
+        // Graceful shutdown: close anything still active on the way out.
+        pool_.close_all();
     }
 
     template <typename Acceptor>
@@ -785,19 +889,33 @@ public:
         Socket sock = acceptor.accept();
         if (!sock.is_valid()) return;
 
-        HttpConnection<Socket, RxSize, TxSize> conn(static_cast<Socket&&>(sock));
-        conn.process(routes_, middleware_, mw_count_);
-        conn.close();
+        auto* conn = pool_.acquire(static_cast<Socket&&>(sock));
+        if (!conn) return;                 // pool full -> drop
+        conn->process(routes_, middleware_, mw_count_);
+        pool_.release(conn);
     }
+
+    // Request the run() loop to stop and gracefully close active connections.
+    void stop() noexcept { running_ = false; }
+
+    // Immediately close every active connection in the pool (graceful shutdown
+    // on stack reset / reboot). Safe to call from a signal/other context.
+    void shutdown() noexcept { pool_.close_all(); }
 
     const RouteTable<MaxRoutes>& routes() const noexcept { return routes_; }
 
     size_t middleware_count() const noexcept { return mw_count_; }
 
+    // Pool introspection (requirement #6).
+    size_t active_connections() const noexcept { return pool_.active(); }
+    static constexpr size_t max_connections() noexcept { return MaxConns; }
+
 private:
-    RouteTable<MaxRoutes> routes_;
-    MiddlewareFn          middleware_[MaxMiddleware] {};
-    size_t                mw_count_ { 0 };
+    RouteTable<MaxRoutes>                            routes_;
+    MiddlewareFn                                     middleware_[MaxMiddleware] {};
+    size_t                                           mw_count_ { 0 };
+    ConnectionPool<Socket, MaxConns, RxSize, TxSize> pool_;
+    bool                                             running_ { false };
 };
 
 } // namespace uchttp

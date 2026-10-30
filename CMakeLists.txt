@@ -25,6 +25,7 @@ target_include_directories(llhttp PUBLIC ${LLHTTP_DIR}/include)
 add_library(uchttp STATIC
     src/uchttp.cpp
     src/uchttp_security.cpp
+    src/uchttp_app_middleware.cpp
 )
 target_include_directories(uchttp PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include

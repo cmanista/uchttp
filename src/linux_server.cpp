@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <csignal>
 #include "uchttp.h"
+#include "uchttp_app_middleware.h"
 #include "linux_socket.h"
 
 static uchttp::LinuxAcceptor* g_acceptor = nullptr;
@@ -154,6 +155,12 @@ int main() {
     // Global middleware – run in registration order around every handler.
     server.use(mw_logger);
     server.use(mw_security_headers);
+
+    // Application middleware (requirement #5): tracing + caching.
+    server.use(uchttp::app::request_id);     // echo/generate X-Request-ID
+    uchttp::app::set_cache_control("public, max-age=60");
+    server.use(uchttp::app::cache_control);  // Cache-Control on every response
+    server.use(uchttp::app::etag);           // ETag + If-None-Match -> 304
 
     server.get ("/",          handle_root);
     server.get ("/api/hello", handle_hello);

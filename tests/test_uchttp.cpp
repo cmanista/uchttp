@@ -17,6 +17,7 @@
 
 #include "uchttp.h"
 #include "uchttp_security.h"
+#include "uchttp_app_middleware.h"
 #include "uchttp_tls.h"
 #include "mock_socket.h"
 
@@ -230,8 +231,9 @@ static const RouteTable<8> kRoutes = make_routes();
 
 class RefMockSocket {
 public:
+    RefMockSocket() = default;
     RefMockSocket(std::string_view rx, std::string& tx_out)
-        : rx_(rx), tx_(tx_out) {}
+        : rx_(rx), tx_(&tx_out) {}
 
     int read(std::span<uint8_t> buf) noexcept {
         if (rx_pos_ >= rx_.size()) return 0;
@@ -242,17 +244,19 @@ public:
     }
 
     int write(std::span<const uint8_t> buf) noexcept {
-        tx_.append(reinterpret_cast<const char*>(buf.data()), buf.size());
+        if (tx_) tx_->append(reinterpret_cast<const char*>(buf.data()),
+                             buf.size());
         return static_cast<int>(buf.size());
     }
 
-    void close() noexcept {}
-    bool is_valid() const noexcept { return true; }
+    void close() noexcept { valid_ = false; }
+    bool is_valid() const noexcept { return valid_; }
 
 private:
-    std::string rx_;
-    size_t      rx_pos_ { 0 };
-    std::string& tx_;
+    std::string  rx_;
+    size_t       rx_pos_ { 0 };
+    std::string* tx_ { nullptr };
+    bool         valid_ { true };
 };
 
 static std::string process_request(std::string_view raw,
@@ -1669,4 +1673,227 @@ TEST(TlsTest, TlsServerTypeCompiles) {
     auto h = [](const HttpRequest&, HttpResponse&) {};
     EXPECT_TRUE(server.get("/secure", h));
     EXPECT_EQ(server.routes().size(), 1u);
+}
+
+// ===========================================================================
+// Requirement #5 — application middleware (cache / etag / request-id)
+// ===========================================================================
+
+TEST(AppMiddlewareTest, CacheControlInjected) {
+    app::set_cache_control("public, max-age=3600");
+    RouteTable<8> rt;
+    rt.add(HttpMethod::GET, "/c", [](const HttpRequest&, HttpResponse& res) {
+        res.set_status(200); res.set_body("x");
+    });
+    MiddlewareFn mws[] = { app::cache_control };
+
+    const std::string raw = "GET /c HTTP/1.1\r\nHost: x\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt, mws, 1);
+
+    EXPECT_EQ(header_value(tx, "Cache-Control"), "public, max-age=3600");
+    app::set_cache_control("no-cache");   // restore default
+}
+
+TEST(AppMiddlewareTest, ComputeEtagStableAndQuoted) {
+    char a[20], b[20];
+    size_t na = app::compute_etag("hello", a, sizeof(a));
+    size_t nb = app::compute_etag("hello", b, sizeof(b));
+    ASSERT_EQ(na, 18u);
+    EXPECT_EQ(std::string_view(a, na), std::string_view(b, nb));  // deterministic
+    EXPECT_EQ(a[0], '"');
+    EXPECT_EQ(a[17], '"');
+    // Different body -> different tag.
+    char c[20];
+    app::compute_etag("world", c, sizeof(c));
+    EXPECT_NE(std::string_view(a, 18), std::string_view(c, 18));
+}
+
+TEST(AppMiddlewareTest, EtagHeaderAdded) {
+    RouteTable<8> rt;
+    rt.add(HttpMethod::GET, "/e", [](const HttpRequest&, HttpResponse& res) {
+        res.set_status(200); res.set_body("payload");
+    });
+    MiddlewareFn mws[] = { app::etag };
+
+    const std::string raw = "GET /e HTTP/1.1\r\nHost: x\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt, mws, 1);
+
+    EXPECT_EQ(parse_status_code(tx), 200);
+    char expect[20];
+    app::compute_etag("payload", expect, sizeof(expect));
+    EXPECT_EQ(header_value(tx, "ETag"), std::string_view(expect, 18));
+}
+
+TEST(AppMiddlewareTest, IfNoneMatchReturns304) {
+    RouteTable<8> rt;
+    rt.add(HttpMethod::GET, "/e", [](const HttpRequest&, HttpResponse& res) {
+        res.set_status(200); res.set_body("payload");
+    });
+    MiddlewareFn mws[] = { app::etag };
+
+    char tag[20];
+    app::compute_etag("payload", tag, sizeof(tag));
+    std::string raw =
+        "GET /e HTTP/1.1\r\nHost: x\r\nIf-None-Match: " +
+        std::string(tag, 18) + "\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt, mws, 1);
+
+    EXPECT_EQ(parse_status_code(tx), 304);
+    // 304 must carry no body.
+    auto pos = tx.find("\r\n\r\n");
+    ASSERT_NE(pos, std::string::npos);
+    EXPECT_EQ(tx.substr(pos + 4), "");
+}
+
+TEST(AppMiddlewareTest, AcceptEncodingDetection) {
+    RouteTable<8> rt;
+    static bool gzip = false, br = false, deflate = false;
+    rt.add(HttpMethod::GET, "/a", [](const HttpRequest& req, HttpResponse& res) {
+        gzip    = app::client_accepts_encoding(req, "gzip");
+        br      = app::client_accepts_encoding(req, "br");
+        deflate = app::client_accepts_encoding(req, "deflate");
+        res.set_status(200);
+    });
+
+    const std::string raw =
+        "GET /a HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip, deflate\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt, nullptr, 0);
+
+    EXPECT_TRUE(gzip);
+    EXPECT_TRUE(deflate);
+    EXPECT_FALSE(br);
+}
+
+TEST(AppMiddlewareTest, RequestIdEchoed) {
+    RouteTable<8> rt;
+    rt.add(HttpMethod::GET, "/r", [](const HttpRequest&, HttpResponse& res) {
+        res.set_status(200);
+    });
+    MiddlewareFn mws[] = { app::request_id };
+
+    const std::string raw =
+        "GET /r HTTP/1.1\r\nHost: x\r\nX-Request-ID: abc-123\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt, mws, 1);
+
+    EXPECT_EQ(header_value(tx, "X-Request-ID"), "abc-123");
+}
+
+TEST(AppMiddlewareTest, RequestIdGeneratedWhenAbsent) {
+    RouteTable<8> rt;
+    rt.add(HttpMethod::GET, "/r", [](const HttpRequest&, HttpResponse& res) {
+        res.set_status(200);
+    });
+    MiddlewareFn mws[] = { app::request_id };
+
+    const std::string raw = "GET /r HTTP/1.1\r\nHost: x\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt, mws, 1);
+
+    auto id = header_value(tx, "X-Request-ID");
+    EXPECT_EQ(id.size(), 16u);           // 16 hex digits
+}
+
+// ===========================================================================
+// Requirement #6 — ConnectionPool + graceful shutdown
+// ===========================================================================
+
+TEST(ConnectionPoolTest, AcquireReleaseReuse) {
+    ConnectionPool<RefMockSocket, 2> pool;
+    EXPECT_EQ(pool.capacity(), 2u);
+    EXPECT_EQ(pool.active(), 0u);
+    EXPECT_FALSE(pool.full());
+
+    std::string tx1;
+    auto* c1 = pool.acquire(RefMockSocket("", tx1));
+    ASSERT_NE(c1, nullptr);
+    EXPECT_EQ(pool.active(), 1u);
+
+    std::string tx2;
+    auto* c2 = pool.acquire(RefMockSocket("", tx2));
+    ASSERT_NE(c2, nullptr);
+    EXPECT_TRUE(pool.full());
+    EXPECT_NE(c1, c2);                    // distinct slots
+
+    pool.release(c1);
+    EXPECT_EQ(pool.active(), 1u);
+    EXPECT_FALSE(pool.full());
+
+    // A new acquire reuses the freed slot (no allocation).
+    std::string tx3;
+    auto* c3 = pool.acquire(RefMockSocket("", tx3));
+    ASSERT_NE(c3, nullptr);
+    EXPECT_EQ(c3, c1);                    // same storage reused
+}
+
+TEST(ConnectionPoolTest, ExhaustionReturnsNullptr) {
+    ConnectionPool<RefMockSocket, 1> pool;
+    std::string tx1;
+    auto* c1 = pool.acquire(RefMockSocket("", tx1));
+    ASSERT_NE(c1, nullptr);
+    std::string tx2;
+    auto* c2 = pool.acquire(RefMockSocket("", tx2));
+    EXPECT_EQ(c2, nullptr);               // pool exhausted
+}
+
+TEST(ConnectionPoolTest, CloseAllGracefulShutdown) {
+    ConnectionPool<RefMockSocket, 3> pool;
+    std::string t1, t2, t3;
+    pool.acquire(RefMockSocket("", t1));
+    pool.acquire(RefMockSocket("", t2));
+    pool.acquire(RefMockSocket("", t3));
+    EXPECT_EQ(pool.active(), 3u);
+
+    pool.close_all();
+    EXPECT_EQ(pool.active(), 0u);
+    EXPECT_FALSE(pool.full());
+
+    // Pool is reusable after shutdown.
+    std::string t4;
+    auto* c = pool.acquire(RefMockSocket("", t4));
+    EXPECT_NE(c, nullptr);
+}
+
+TEST(ConnectionPoolTest, PooledConnectionServesRequest) {
+    RouteTable<8> rt;
+    static bool ran = false;
+    rt.add(HttpMethod::GET, "/p", [](const HttpRequest&, HttpResponse& res) {
+        ran = true; res.set_status(200); res.set_body("pooled");
+    });
+
+    ConnectionPool<RefMockSocket, 2> pool;
+    std::string tx;
+    auto* conn = pool.acquire(
+        RefMockSocket("GET /p HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", tx));
+    ASSERT_NE(conn, nullptr);
+    conn->process(rt);
+    pool.release(conn);
+
+    EXPECT_TRUE(ran);
+    EXPECT_EQ(parse_status_code(tx), 200);
+    EXPECT_EQ(pool.active(), 0u);
+}
+
+TEST(HttpServerTest, PoolIntrospection) {
+    HttpServer<MockSocket> server;
+    EXPECT_EQ(server.active_connections(), 0u);
+    EXPECT_EQ(server.max_connections(), UCHTTP_MAX_CONNECTIONS);
+    server.shutdown();                    // safe to call when idle
+    EXPECT_EQ(server.active_connections(), 0u);
 }

@@ -120,6 +120,18 @@ bool HttpResponse::keep_alive() const noexcept {
     return keep_alive_;
 }
 
+int HttpResponse::status() const noexcept {
+    return status_code_;
+}
+
+std::string_view HttpResponse::body() const noexcept {
+    return body_;
+}
+
+std::string_view HttpResponse::content_type() const noexcept {
+    return content_type_;
+}
+
 void HttpResponse::reset() noexcept {
     len_              = 0;
     sent_             = false;
