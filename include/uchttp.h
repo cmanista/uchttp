@@ -198,7 +198,20 @@ struct HttpRequest {
     uint8_t    param_count { 0 };
     PathParam  path_params[UCHTTP_MAX_PATH_PARAMS];
 
+    // Protocol metadata handled by the engine (requirement #3). Filled in by
+    // the parser at on_headers_complete. These are NOT visible to middleware
+    // as application state — they govern how the sockets physically talk.
+    uint8_t  http_major    { 1 };      // HTTP/<major>.<minor>
+    uint8_t  http_minor    { 1 };
+    bool     keep_alive    { false };  // llhttp_should_keep_alive() result
+    bool     chunked       { false };  // Transfer-Encoding: chunked present
+    uint64_t content_length { 0 };     // declared Content-Length (0 if absent)
+
     std::string_view get_header(std::string_view name) const noexcept;
+
+    // Protocol accessors (defined in uchttp.cpp) ----------------------------
+    // Host header — used by the server for (virtual-host) routing.
+    std::string_view host() const noexcept;
 
     // Query string accessors (defined in uchttp.cpp) ------------------------
     QueryString      query() const noexcept;
@@ -220,7 +233,15 @@ public:
     void set_status(int code, std::string_view reason = {}) noexcept;
     void add_header(std::string_view name, std::string_view value) noexcept;
     void set_content_type(std::string_view ct) noexcept;
+    void set_content_encoding(std::string_view enc) noexcept;
     void set_body(std::string_view body) noexcept;
+
+    // Connection lifecycle (requirement #3). The engine sets this from the
+    // request's keep-alive state before the handler runs; send() emits the
+    // matching "Connection: keep-alive" / "Connection: close" header.
+    void set_keep_alive(bool v) noexcept;
+    bool keep_alive() const noexcept;
+
     void reset() noexcept;
 
     std::string_view formatted() const noexcept;
@@ -243,6 +264,17 @@ public:
             append(content_type_);
             append("\r\n");
         }
+
+        if (!content_encoding_.empty()) {
+            append("Content-Encoding: ");
+            append(content_encoding_);
+            append("\r\n");
+        }
+
+        // Connection header is owned by the engine (requirement #3): tell the
+        // client whether we will keep the socket open or close it.
+        append(keep_alive_ ? "Connection: keep-alive\r\n"
+                           : "Connection: close\r\n");
 
         if (!body_.empty()) {
             append("Content-Length: ");
@@ -288,7 +320,9 @@ private:
     int              status_code_   { 200 };
     std::string_view status_reason_ { "OK" };
     std::string_view content_type_;
+    std::string_view content_encoding_;
     std::string_view body_;
+    bool             keep_alive_ { false };
 
     uint8_t    hdr_count_ { 0 };
     HttpHeader resp_headers_[UCHTTP_MAX_HEADERS];
@@ -520,54 +554,122 @@ public:
     bool process(const RouteTable<MaxRoutes>& routes,
                  const MiddlewareFn* middleware = nullptr,
                  size_t middleware_count = 0) noexcept {
-        state_.reset();
+        // One llhttp parser instance drives the whole connection; it natively
+        // supports multiple messages back-to-back. on_message_complete returns
+        // HPE_PAUSED so a single read() carrying the tail of one request and
+        // the head of the next does not clobber the current request's state.
         llhttp_reset(&parser_);
 
-        size_t total = 0;
-        while (total < RxSize && !state_.message_complete && !state_.parse_error) {
-            auto buf = std::span<uint8_t>(rx_buf_.data() + total,
-                                          rx_buf_.size()  - total);
-            int n = socket_.read(buf);
-            if (n <= 0) break;
+        bool   handled_any = false;
+        size_t buffered    = 0;   // valid bytes currently in rx_buf_
 
-            llhttp_errno_t err = llhttp_execute(
-                &parser_,
-                reinterpret_cast<const char*>(rx_buf_.data() + total),
-                static_cast<size_t>(n));
+        // Keep-alive loop (requirement #3): serve consecutive requests on the
+        // same socket until the client/engine decides to close it.
+        while (true) {
+            state_.reset();
 
-            if (err != HPE_OK && err != HPE_PAUSED) {
-                state_.parse_error = true;
-                break;
+            // --- read + parse exactly one complete request -----------------
+            size_t consumed = 0;   // bytes of rx_buf_ consumed by this request
+
+            while (!state_.message_complete && !state_.parse_error) {
+                if (consumed < buffered) {
+                    const char* at = reinterpret_cast<const char*>(
+                        rx_buf_.data() + consumed);
+                    size_t avail = buffered - consumed;
+
+                    llhttp_errno_t err = llhttp_execute(&parser_, at, avail);
+
+                    if (err == HPE_PAUSED) {
+                        // message_complete paused us; compute bytes used by
+                        // this request, then resume for the next one.
+                        const char* stop = llhttp_get_error_pos(&parser_);
+                        consumed += static_cast<size_t>(
+                            reinterpret_cast<const uint8_t*>(stop)
+                            - (rx_buf_.data() + consumed));
+                        llhttp_resume(&parser_);
+                        break;
+                    }
+                    if (err != HPE_OK) {
+                        state_.parse_error = true;
+                        break;
+                    }
+                    consumed = buffered;   // consumed everything buffered
+                }
+
+                // Need more data: compact any leftover to the front, then read.
+                if (consumed > 0) {
+                    size_t rest = buffered - consumed;
+                    if (rest > 0)
+                        __builtin_memmove(rx_buf_.data(),
+                                          rx_buf_.data() + consumed, rest);
+                    buffered = rest;
+                    consumed = 0;
+                }
+                if (buffered >= RxSize) {
+                    state_.parse_error = true;   // request exceeds static buffer
+                    break;
+                }
+                auto buf = std::span<uint8_t>(rx_buf_.data() + buffered,
+                                              RxSize - buffered);
+                int n = socket_.read(buf);
+                if (n <= 0) break;               // EOF / error
+                buffered += static_cast<size_t>(n);
             }
-            total += static_cast<size_t>(n);
+
+            if (state_.parse_error) {
+                // Malformed syntax: engine answers 400 before any middleware.
+                send_error(400, "Bad Request", false);
+                return handled_any;        // cannot trust the stream -> close
+            }
+            if (!state_.message_complete) {
+                // Clean EOF (client closed) or no data -> nothing more to do.
+                return handled_any;
+            }
+
+            handled_any = true;
+
+            // --- dispatch --------------------------------------------------
+            const bool keep = state_.request.keep_alive;
+
+            response_.bind(std::span<char>(tx_buf_.data(), tx_buf_.size()));
+            response_.reset();
+            response_.set_keep_alive(keep);
+
+            if (state_.request.method == HttpMethod::UNKNOWN) {
+                // Parser accepted the syntax but the method is one we do not
+                // implement (e.g. TRACE/CONNECT) -> 501 Not Implemented.
+                send_error(501, "Not Implemented", keep);
+            } else {
+                const Route* route = routes.find(state_.request.method,
+                                                  state_.request.path,
+                                                  state_.request);
+                if (route && route->handler) {
+                    MiddlewareChain chain(middleware, middleware_count,
+                                          route->handler);
+                    chain.run(state_.request, response_);
+                    (void)response_.send(socket_);
+                } else if (routes.path_exists(state_.request.path)) {
+                    send_error(405, "Method Not Allowed", keep);
+                } else {
+                    send_error(404, "Not Found", keep);
+                }
+            }
+
+            // --- connection lifecycle -------------------------------------
+            if (!keep) {
+                break;   // Connection: close (or HTTP/1.0 without keep-alive)
+            }
+            // Compact any pipelined leftover to the front, then serve it next.
+            if (consumed > 0) {
+                size_t rest = buffered - consumed;
+                if (rest > 0)
+                    __builtin_memmove(rx_buf_.data(),
+                                      rx_buf_.data() + consumed, rest);
+                buffered = rest;
+            }
         }
 
-        if (state_.parse_error) {
-            send_error(400, "Bad Request");
-            return false;
-        }
-        if (!state_.message_complete) {
-            return false;
-        }
-
-        response_.bind(std::span<char>(tx_buf_.data(), tx_buf_.size()));
-        response_.reset();
-
-        const Route* route = routes.find(state_.request.method,
-                                          state_.request.path,
-                                          state_.request);
-        if (route && route->handler) {
-            MiddlewareChain chain(middleware, middleware_count, route->handler);
-            chain.run(state_.request, response_);
-            (void)response_.send(socket_);
-        } else if (routes.path_exists(state_.request.path)) {
-            // Path exists but not for this method -> 405 Method Not Allowed.
-            send_error(405, "Method Not Allowed");
-        } else {
-            send_error(404, "Not Found");
-        }
-
-        return true;
+        return handled_any;
     }
 
     void close() noexcept { socket_.close(); }
@@ -581,9 +683,10 @@ private:
     std::array<uint8_t, RxSize> rx_buf_{};
     std::array<char,    TxSize> tx_buf_{};
 
-    void send_error(int code, std::string_view msg) noexcept {
+    void send_error(int code, std::string_view msg, bool keep) noexcept {
         response_.bind(std::span<char>(tx_buf_.data(), tx_buf_.size()));
         response_.reset();
+        response_.set_keep_alive(keep);
         response_.send(socket_, code, msg, "text/plain");
     }
 };

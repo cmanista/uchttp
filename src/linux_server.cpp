@@ -58,13 +58,18 @@ static void mw_security_headers(const uchttp::HttpRequest& req,
 // Route handlers
 // ---------------------------------------------------------------------------
 
-static void handle_root(const uchttp::HttpRequest& /*req*/,
+static void handle_root(const uchttp::HttpRequest& req,
                          uchttp::HttpResponse& res) {
+    // req.host() exposes the Host header the engine uses for routing.
+    static char buf[256];
+    int n = std::snprintf(buf, sizeof(buf),
+        "<html><body><h1>uchttp on Linux</h1>"
+        "<p>Microcontroller HTTP server - running on host PC.</p>"
+        "<p>Host: %.*s</p></body></html>",
+        static_cast<int>(req.host().size()), req.host().data());
     res.set_status(200);
     res.set_content_type("text/html");
-    res.set_body("<html><body><h1>uchttp on Linux</h1>"
-                 "<p>Microcontroller HTTP server – running on host PC.</p>"
-                 "</body></html>");
+    res.set_body(std::string_view(buf, static_cast<size_t>(n)));
 }
 
 static void handle_hello(const uchttp::HttpRequest& /*req*/,

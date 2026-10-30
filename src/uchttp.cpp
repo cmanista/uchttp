@@ -44,6 +44,10 @@ std::string_view HttpRequest::get_header(std::string_view name) const noexcept {
     return {};
 }
 
+std::string_view HttpRequest::host() const noexcept {
+    return get_header("Host");
+}
+
 QueryString HttpRequest::query() const noexcept {
     return QueryString(raw_query);
 }
@@ -60,12 +64,17 @@ std::string_view HttpRequest::path_param(std::string_view name) const noexcept {
 }
 
 void HttpRequest::reset() noexcept {
-    method       = HttpMethod::UNKNOWN;
-    path         = {};
-    raw_query    = {};
-    body         = {};
-    header_count = 0;
-    param_count  = 0;
+    method         = HttpMethod::UNKNOWN;
+    path           = {};
+    raw_query      = {};
+    body           = {};
+    header_count   = 0;
+    param_count    = 0;
+    http_major     = 1;
+    http_minor     = 1;
+    keep_alive     = false;
+    chunked        = false;
+    content_length = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -95,18 +104,32 @@ void HttpResponse::set_content_type(std::string_view ct) noexcept {
     content_type_ = ct;
 }
 
+void HttpResponse::set_content_encoding(std::string_view enc) noexcept {
+    content_encoding_ = enc;
+}
+
 void HttpResponse::set_body(std::string_view body) noexcept {
     body_ = body;
 }
 
+void HttpResponse::set_keep_alive(bool v) noexcept {
+    keep_alive_ = v;
+}
+
+bool HttpResponse::keep_alive() const noexcept {
+    return keep_alive_;
+}
+
 void HttpResponse::reset() noexcept {
-    len_           = 0;
-    sent_          = false;
-    status_code_   = 200;
-    status_reason_ = "OK";
-    content_type_  = {};
-    body_          = {};
-    hdr_count_     = 0;
+    len_              = 0;
+    sent_             = false;
+    status_code_      = 200;
+    status_reason_    = "OK";
+    content_type_     = {};
+    content_encoding_ = {};
+    body_             = {};
+    keep_alive_       = false;
+    hdr_count_        = 0;
 }
 
 std::string_view HttpResponse::formatted() const noexcept {
@@ -124,6 +147,7 @@ const char* HttpResponse::default_reason(int code) noexcept {
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
         case 500: return "Internal Server Error";
+        case 501: return "Not Implemented";
         default:  return "Unknown";
     }
 }
@@ -254,6 +278,12 @@ static int cb_on_headers_complete(llhttp_t* p) noexcept {
     s->commit_header();
     s->request.method = llhttp_method_to_uchttp(llhttp_get_method(p));
 
+    // Protocol metadata handled directly by the engine (requirement #3).
+    s->request.http_major = llhttp_get_http_major(p);
+    s->request.http_minor = llhttp_get_http_minor(p);
+    s->request.content_length = p->content_length;
+    s->request.chunked = (p->flags & F_CHUNKED) != 0;
+
     // Split the accumulated URL into path + query string (zero-copy).
     // The full URL was accumulated contiguously into request.path by cb_on_url.
     std::string_view url = s->request.path;
@@ -270,8 +300,19 @@ static int cb_on_headers_complete(llhttp_t* p) noexcept {
 static int cb_on_body(llhttp_t* p, const char* at, size_t len) noexcept {
     auto* s = static_cast<ParseState*>(p->data);
     if (s->request.body.empty()) {
+        // First fragment: body starts where llhttp points into the RX buffer.
         s->request.body = { at, len };
     } else {
+        // Subsequent fragment. With Content-Length the data is contiguous and
+        // `at` already equals body.end() (the memmove is a no-op). With chunked
+        // transfer-encoding the decoded chunks are separated by chunk framing
+        // in the buffer, so we compact each fragment right after the previous
+        // one to expose a single contiguous, decoded body (zero extra buffer).
+        char* dst = const_cast<char*>(s->request.body.data()
+                                      + s->request.body.size());
+        if (dst != at) {
+            __builtin_memmove(dst, at, len);
+        }
         s->request.body = { s->request.body.data(),
                             s->request.body.size() + len };
     }
@@ -281,7 +322,13 @@ static int cb_on_body(llhttp_t* p, const char* at, size_t len) noexcept {
 static int cb_on_message_complete(llhttp_t* p) noexcept {
     auto* s = static_cast<ParseState*>(p->data);
     s->message_complete = true;
-    return HPE_OK;
+    // Connection lifecycle (requirement #3): llhttp evaluates HTTP version +
+    // Connection header to decide whether the socket may be reused.
+    s->request.keep_alive = llhttp_should_keep_alive(p) != 0;
+    // Pause so that a single read() carrying the tail of this request AND the
+    // head of the next (keep-alive / pipelining) does not overwrite the
+    // current request's state. The engine resumes after dispatching.
+    return HPE_PAUSED;
 }
 
 // ---------------------------------------------------------------------------

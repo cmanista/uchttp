@@ -1126,3 +1126,251 @@ TEST(HttpServerTest, UseRespectsCapacity) {
     EXPECT_FALSE(server.use(mw));  // full
     EXPECT_EQ(server.middleware_count(), 2u);
 }
+
+// ===========================================================================
+// Requirement #3 — headers handled directly by the engine
+// ===========================================================================
+
+// Count how many HTTP responses are present in a raw TX stream.
+static int count_responses(std::string_view tx) {
+    int n = 0;
+    size_t pos = 0;
+    while ((pos = tx.find("HTTP/1.1 ", pos)) != std::string_view::npos) {
+        ++n; pos += 9;
+    }
+    return n;
+}
+
+// --- Host accessor ---------------------------------------------------------
+
+TEST(CoreHeadersTest, HostAccessor) {
+    RouteTable<8> rt;
+    static std::string captured_host;
+    rt.add(HttpMethod::GET, "/h", [](const HttpRequest& req, HttpResponse& res) {
+        captured_host = std::string(req.host());
+        res.set_status(200);
+    });
+
+    const std::string raw =
+        "GET /h HTTP/1.1\r\nHost: example.com:8080\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt);
+
+    EXPECT_EQ(captured_host, "example.com:8080");
+}
+
+// --- Content-Length / Transfer-Encoding exposure ---------------------------
+
+TEST(CoreHeadersTest, ContentLengthExposed) {
+    RouteTable<8> rt;
+    static uint64_t seen_len = 0;
+    static bool     seen_chunked = true;
+    rt.add(HttpMethod::POST, "/c", [](const HttpRequest& req, HttpResponse& res) {
+        seen_len     = req.content_length;
+        seen_chunked = req.chunked;
+        res.set_status(200);
+    });
+
+    std::string payload = "hello world";   // 11 bytes
+    std::string raw =
+        "POST /c HTTP/1.1\r\nHost: x\r\n"
+        "Content-Length: " + std::to_string(payload.size()) + "\r\n\r\n" + payload;
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt);
+
+    EXPECT_EQ(seen_len, 11u);
+    EXPECT_FALSE(seen_chunked);
+}
+
+TEST(CoreHeadersTest, ChunkedTransferEncodingExposed) {
+    RouteTable<8> rt;
+    static bool        seen_chunked = false;
+    static std::string seen_body;
+    rt.add(HttpMethod::POST, "/chunk", [](const HttpRequest& req, HttpResponse& res) {
+        seen_chunked = req.chunked;
+        seen_body    = std::string(req.body);
+        res.set_status(200);
+    });
+
+    // "Wikipedia" split into chunks per the classic RFC example.
+    const std::string raw =
+        "POST /chunk HTTP/1.1\r\nHost: x\r\n"
+        "Transfer-Encoding: chunked\r\n\r\n"
+        "4\r\nWiki\r\n"
+        "5\r\npedia\r\n"
+        "0\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt);
+
+    EXPECT_TRUE(seen_chunked);
+    EXPECT_EQ(seen_body, "Wikipedia");
+}
+
+TEST(CoreHeadersTest, HttpVersionExposed) {
+    RouteTable<8> rt;
+    static uint8_t major = 0, minor = 0;
+    rt.add(HttpMethod::GET, "/v", [](const HttpRequest& req, HttpResponse& res) {
+        major = req.http_major; minor = req.http_minor;
+        res.set_status(200);
+    });
+
+    const std::string raw = "GET /v HTTP/1.1\r\nHost: x\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt);
+
+    EXPECT_EQ(major, 1);
+    EXPECT_EQ(minor, 1);
+}
+
+// --- Connection header in the response -------------------------------------
+
+TEST(CoreHeadersTest, ResponseConnectionCloseForHttp10) {
+    RouteTable<8> rt;
+    rt.add(HttpMethod::GET, "/x", [](const HttpRequest&, HttpResponse& res) {
+        res.set_status(200);
+    });
+
+    // HTTP/1.0 without keep-alive -> server must announce close.
+    const std::string raw = "GET /x HTTP/1.0\r\nHost: x\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt);
+
+    EXPECT_EQ(header_value(tx, "Connection"), "close");
+}
+
+TEST(CoreHeadersTest, ResponseConnectionKeepAliveForHttp11) {
+    RouteTable<8> rt;
+    rt.add(HttpMethod::GET, "/x", [](const HttpRequest&, HttpResponse& res) {
+        res.set_status(200);
+    });
+
+    // HTTP/1.1 defaults to keep-alive.
+    const std::string raw = "GET /x HTTP/1.1\r\nHost: x\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt);
+
+    EXPECT_EQ(header_value(tx, "Connection"), "keep-alive");
+}
+
+TEST(CoreHeadersTest, ExplicitConnectionCloseHonoured) {
+    RouteTable<8> rt;
+    rt.add(HttpMethod::GET, "/x", [](const HttpRequest&, HttpResponse& res) {
+        res.set_status(200);
+    });
+
+    const std::string raw =
+        "GET /x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt);
+
+    EXPECT_EQ(header_value(tx, "Connection"), "close");
+}
+
+// --- Keep-alive loop: multiple requests on one connection ------------------
+
+TEST(CoreHeadersTest, KeepAliveServesTwoRequests) {
+    RouteTable<8> rt;
+    static int hits = 0;
+    rt.add(HttpMethod::GET, "/a", [](const HttpRequest&, HttpResponse& res) {
+        ++hits; res.set_status(200); res.set_body("A");
+    });
+    rt.add(HttpMethod::GET, "/b", [](const HttpRequest&, HttpResponse& res) {
+        ++hits; res.set_status(200); res.set_body("B");
+    });
+
+    // Two pipelined keep-alive requests, second one closes the connection.
+    const std::string raw =
+        "GET /a HTTP/1.1\r\nHost: x\r\n\r\n"
+        "GET /b HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    bool ok = conn.process(rt);
+
+    EXPECT_TRUE(ok);
+    EXPECT_EQ(hits, 2);                 // both handlers ran
+    EXPECT_EQ(count_responses(tx), 2);  // two responses emitted
+    // First response keep-alive, second close.
+    auto first_conn = header_value(tx, "Connection");
+    EXPECT_EQ(first_conn, "keep-alive");
+}
+
+TEST(CoreHeadersTest, CloseStopsAfterOneRequest) {
+    RouteTable<8> rt;
+    static int hits = 0;
+    rt.add(HttpMethod::GET, "/a", [](const HttpRequest&, HttpResponse& res) {
+        ++hits; res.set_status(200);
+    });
+
+    // Even though a second request is present, Connection: close on the first
+    // must stop the loop and leave the second unserved.
+    const std::string raw =
+        "GET /a HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+        "GET /a HTTP/1.1\r\nHost: x\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt);
+
+    EXPECT_EQ(hits, 1);
+    EXPECT_EQ(count_responses(tx), 1);
+}
+
+// --- 501 Not Implemented ---------------------------------------------------
+
+TEST(CoreHeadersTest, UnknownMethodReturns501) {
+    RouteTable<8> rt;
+    rt.add(HttpMethod::GET, "/t", [](const HttpRequest&, HttpResponse& res) {
+        res.set_status(200);
+    });
+
+    // TRACE is a valid HTTP method llhttp parses, but uchttp does not map it
+    // -> HttpMethod::UNKNOWN -> 501 Not Implemented.
+    const std::string raw = "TRACE /t HTTP/1.1\r\nHost: x\r\n\r\n";
+    std::string tx;
+    RefMockSocket sock(raw, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt);
+
+    EXPECT_EQ(parse_status_code(tx), 501);
+}
+
+// --- Content-Encoding in the response --------------------------------------
+
+TEST(CoreHeadersTest, ResponseContentEncoding) {
+    char buf[512];
+    HttpResponse res;
+    res.bind(std::span<char>(buf, sizeof(buf)));
+    res.set_status(200);
+    res.set_content_type("application/json");
+    res.set_content_encoding("gzip");
+    res.set_body("{}");
+    MockSocket sock;
+    res.send(sock);
+
+    EXPECT_EQ(header_value(sock.tx_string(), "Content-Encoding"), "gzip");
+}
+
+TEST(CoreHeadersTest, ResponseDefaultsToConnectionClose) {
+    // A standalone HttpResponse (no engine) defaults to Connection: close.
+    char buf[512];
+    HttpResponse res;
+    res.bind(std::span<char>(buf, sizeof(buf)));
+    MockSocket sock;
+    res.send(sock, 200, "x");
+    EXPECT_EQ(header_value(sock.tx_string(), "Connection"), "close");
+}
