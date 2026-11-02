@@ -427,15 +427,17 @@ No other changes are needed — the core library has no OS dependencies.
 
 ## Zephyr OS integration
 
-uchttp ships as a Zephyr module (Stage 1: HTTP, no TLS). The module build is
-kept separate from the host CMake build:
+uchttp ships as a Zephyr module (Stage 1: HTTP; Stage 2: HTTPS/TLS). The module
+build is kept separate from the host CMake build:
 
 ```
 zephyr/module.yml      declares the module (build cmake + Kconfig)
 zephyr/CMakeLists.txt  zephyr_library() — core + middleware + port + llhttp
-zephyr/Kconfig         CONFIG_UCHTTP and CONFIG_UCHTTP_* tunables
+zephyr/Kconfig         CONFIG_UCHTTP, CONFIG_UCHTTP_TLS and CONFIG_UCHTTP_* tunables
 src/port/zephyr_socket.{h,cpp}   ZephyrSocket + ZephyrAcceptor (zsock_*/net_* API)
-samples/zephyr/http_server/      runnable sample (HttpServer<ZephyrSocket>)
+src/port/zephyr_tls.{h,cpp}      ZephyrTlsAcceptor + ZephyrTlsCredentials (TLS, Stage 2)
+samples/zephyr/http_server/      runnable HTTP sample (HttpServer<ZephyrSocket>)
+samples/zephyr/https_server/     runnable HTTPS sample (TLS, Stage 2)
 ```
 
 The core (`uchttp.h`) is unchanged — only the socket/acceptor port differs.
@@ -468,7 +470,63 @@ CONFIG_NET_SOCKETS=y
 ```
 
 Both `native_sim` and `frdm_rw612` builds are verified for Zephyr 4.5
-(SDK 0.17/1.0). HTTPS (Mbed TLS / PSA Crypto) is Stage 2.
+(SDK 0.17/1.0).
+
+### HTTPS / TLS (Stage 2)
+
+On Zephyr, TLS is handled transparently at the socket layer by the native
+secure-sockets stack (backed by **Mbed TLS / PSA Crypto**): a listening socket
+is created with `IPPROTO_TLS_1_2` and bound to a credential tag, and every
+accepted socket encrypts/decrypts inside `recv()`/`send()`. Because of that the
+plaintext `ZephyrSocket` works unchanged over TLS — Stage 2 only adds a
+TLS-aware acceptor (`ZephyrTlsAcceptor`) plus a credential helper
+(`ZephyrTlsCredentials`). The engine (`HttpServer<ZephyrSocket>`) is identical.
+
+```cpp
+#include "zephyr_tls.h"
+
+// Register the server certificate + key (PEM/DER, NUL-terminated for PEM).
+// The credential store keeps pointers to the buffers, so keep them alive
+// (e.g. `static const` in flash).
+uchttp::ZephyrTlsCredentials::add_server_cert(
+    UCHTTP_TLS_SERVER_CERT_TAG,
+    server_certificate, server_certificate_len,
+    private_key,        private_key_len);
+
+uchttp::ZephyrTlsAcceptor acceptor(8443, UCHTTP_TLS_SERVER_CERT_TAG);
+uchttp::HttpServer<uchttp::ZephyrSocket> server;   // same engine, now over TLS
+server.get("/api/hello", handler);
+server.run(acceptor);
+```
+
+Pre-shared keys (`ZephyrTlsCredentials::add_psk`) and mutual TLS
+(`acceptor.set_peer_verify(...)` + `add_ca_cert`) are also supported. Enable the
+TLS port with `CONFIG_UCHTTP_TLS=y`, which selects
+`CONFIG_NET_SOCKETS_SOCKOPT_TLS`, `CONFIG_TLS_CREDENTIALS` and `CONFIG_MBEDTLS`;
+size the Mbed TLS heap and content buffers in your `prj.conf`
+(`CONFIG_MBEDTLS_HEAP_SIZE`, `CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN` /
+`..._OUT_CONTENT_LEN`).
+
+```bash
+# HTTPS sample — host sanity check (WiFi is swapped for native TAP Ethernet)
+west build -p always -b native_sim samples/zephyr/https_server \
+    -- -DZEPHYR_EXTRA_MODULES=$(pwd)
+
+# Target board (NXP FRDM-RW612) — uses the on-SoC WiFi + ELS/PKC PSA driver
+west build -p always -b frdm_rw612 samples/zephyr/https_server \
+    -- -DZEPHYR_EXTRA_MODULES=$(pwd)
+```
+
+On FRDM-RW612, connect WiFi from the shell, then:
+
+```bash
+curl -k https://<device-ip>:8443/api/hello   # -k: accept the demo self-signed cert
+```
+
+The sample embeds a self-signed demo certificate in
+`samples/zephyr/https_server/src/certificate.h` (regenerate with the `openssl`
+command noted in that header). Both `native_sim` and `frdm_rw612` HTTPS builds
+are verified against Zephyr 4.5 / SDK 1.0.
 
 ## File map
 
@@ -483,8 +541,10 @@ src/linux_socket.h        POSIX LinuxSocket + LinuxAcceptor
 src/linux_server.cpp      Example HTTP server on localhost
 src/linux_https_server.cpp Example HTTPS server (OpenSSL)
 src/port/zephyr_socket.{h,cpp}  Zephyr ZephyrSocket + ZephyrAcceptor
+src/port/zephyr_tls.{h,cpp}     Zephyr ZephyrTlsAcceptor + ZephyrTlsCredentials (TLS)
 zephyr/                   Zephyr module (module.yml, CMakeLists.txt, Kconfig)
-samples/zephyr/http_server/     Zephyr sample app (HttpServer<ZephyrSocket>)
+samples/zephyr/http_server/     Zephyr HTTP sample (HttpServer<ZephyrSocket>)
+samples/zephyr/https_server/    Zephyr HTTPS sample (TLS, Mbed TLS / PSA Crypto)
 tests/mock_socket.h       In-memory socket for unit tests
 tests/test_uchttp.cpp     109 gtest unit tests
 CMakeLists.txt            Build system

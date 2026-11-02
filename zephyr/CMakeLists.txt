@@ -1,4 +1,4 @@
-# uchttp Zephyr module build (Stage 1: HTTP only, no TLS).
+# uchttp Zephyr module build (Stage 1: HTTP, Stage 2: HTTPS/TLS).
 # Kept separate from the host CMakeLists.txt so the plain host/CMake build is
 # untouched. Enabled by CONFIG_UCHTTP.
 
@@ -15,6 +15,13 @@ if(CONFIG_UCHTTP)
     ${UCHTTP_ROOT}/src/uchttp_security.cpp
     ${UCHTTP_ROOT}/src/uchttp_app_middleware.cpp
     ${UCHTTP_ROOT}/src/port/zephyr_socket.cpp
+  )
+
+  # Stage 2: HTTPS/TLS port (ZephyrTlsAcceptor / ZephyrTlsCredentials) over
+  # Zephyr's native secure sockets (Mbed TLS / PSA Crypto). Only built when
+  # CONFIG_UCHTTP_TLS is enabled so HTTP-only builds stay lean.
+  zephyr_library_sources_ifdef(CONFIG_UCHTTP_TLS
+    ${UCHTTP_ROOT}/src/port/zephyr_tls.cpp
   )
 
   # llhttp parser (C).

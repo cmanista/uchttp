@@ -1,0 +1,8 @@
+/*
+ * FRDM-RW612 overlay for the uchttp WiFi sample.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+&standby {
+	status = "okay";
+};

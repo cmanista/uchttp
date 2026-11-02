@@ -1,4 +1,4 @@
-# uchttp — microcontroller HTTP server, Zephyr module (Stage 1: HTTP only)
+# uchttp — microcontroller HTTP server, Zephyr module (Stage 1: HTTP, Stage 2: HTTPS/TLS)
 
 menuconfig UCHTTP
 	bool "uchttp HTTP server"
@@ -54,5 +54,23 @@ config UCHTTP_IDLE_TIMEOUT_MS
 	default 5000
 	help
 	  A connection whose peer stalls longer than this is dropped. 0 disables.
+
+config UCHTTP_TLS
+	bool "HTTPS / TLS support (Stage 2)"
+	select NET_SOCKETS_SOCKOPT_TLS
+	select TLS_CREDENTIALS
+	select MBEDTLS
+	help
+	  Build the Zephyr TLS port (ZephyrTlsAcceptor / ZephyrTlsCredentials).
+	  TLS is provided by Zephyr's native secure sockets layer, backed by
+	  Mbed TLS / PSA Crypto. A listening socket is created with
+	  IPPROTO_TLS_1_2 and bound to a credential sec_tag; accepted sockets
+	  decrypt/encrypt transparently, so HttpServer<ZephyrSocket> runs over
+	  HTTPS unchanged.
+
+	  Register the server certificate and key (or a PSK) with
+	  uchttp::ZephyrTlsCredentials before starting the acceptor. You will
+	  typically also want to raise the TLS buffer sizes in your prj.conf,
+	  e.g. CONFIG_MBEDTLS_HEAP_SIZE and the content-length limits.
 
 endif # UCHTTP
