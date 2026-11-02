@@ -425,6 +425,51 @@ server.shutdown();                     // close all active connections
 
 No other changes are needed — the core library has no OS dependencies.
 
+## Zephyr OS integration
+
+uchttp ships as a Zephyr module (Stage 1: HTTP, no TLS). The module build is
+kept separate from the host CMake build:
+
+```
+zephyr/module.yml      declares the module (build cmake + Kconfig)
+zephyr/CMakeLists.txt  zephyr_library() — core + middleware + port + llhttp
+zephyr/Kconfig         CONFIG_UCHTTP and CONFIG_UCHTTP_* tunables
+src/port/zephyr_socket.{h,cpp}   ZephyrSocket + ZephyrAcceptor (zsock_*/net_* API)
+samples/zephyr/http_server/      runnable sample (HttpServer<ZephyrSocket>)
+```
+
+The core (`uchttp.h`) is unchanged — only the socket/acceptor port differs.
+`ZephyrSocket` uses Zephyr's native `zsock_*` / `net_*` socket API (not the
+POSIX aliases), so it builds cleanly on both `native_sim` and real targets.
+
+### Building the sample (west)
+
+Once the repo is on your `west` manifest (or via `ZEPHYR_EXTRA_MODULES`):
+
+```bash
+# Quick host sanity check
+west build -p always -b native_sim samples/zephyr/http_server \
+    -- -DZEPHYR_EXTRA_MODULES=$(pwd)
+
+# Target board (NXP FRDM-RW612)
+west build -p always -b frdm_rw612 samples/zephyr/http_server \
+    -- -DZEPHYR_EXTRA_MODULES=$(pwd)
+```
+
+Enable the module and the networking stack from your `prj.conf`:
+
+```
+CONFIG_CPP=y
+CONFIG_STD_CPP23=y
+CONFIG_UCHTTP=y
+CONFIG_NETWORKING=y
+CONFIG_NET_TCP=y
+CONFIG_NET_SOCKETS=y
+```
+
+Both `native_sim` and `frdm_rw612` builds are verified for Zephyr 4.5
+(SDK 0.17/1.0). HTTPS (Mbed TLS / PSA Crypto) is Stage 2.
+
 ## File map
 
 ```
@@ -437,6 +482,9 @@ include/wolfssl_tls.h     wolfSSL backend (embedded)
 src/linux_socket.h        POSIX LinuxSocket + LinuxAcceptor
 src/linux_server.cpp      Example HTTP server on localhost
 src/linux_https_server.cpp Example HTTPS server (OpenSSL)
+src/port/zephyr_socket.{h,cpp}  Zephyr ZephyrSocket + ZephyrAcceptor
+zephyr/                   Zephyr module (module.yml, CMakeLists.txt, Kconfig)
+samples/zephyr/http_server/     Zephyr sample app (HttpServer<ZephyrSocket>)
 tests/mock_socket.h       In-memory socket for unit tests
 tests/test_uchttp.cpp     109 gtest unit tests
 CMakeLists.txt            Build system

@@ -1,0 +1,58 @@
+# uchttp — microcontroller HTTP server, Zephyr module (Stage 1: HTTP only)
+
+menuconfig UCHTTP
+	bool "uchttp HTTP server"
+	depends on CPP
+	help
+	  Lightweight HTTP/1.1 server for microcontrollers. Provides the core
+	  engine plus the Zephyr BSD-socket port (ZephyrSocket / ZephyrAcceptor).
+	  The core library performs no dynamic allocation.
+
+	  Requires the networking stack and POSIX socket API; enable them in your
+	  application's prj.conf:
+	    CONFIG_NETWORKING=y
+	    CONFIG_NET_TCP=y
+	    CONFIG_NET_SOCKETS=y
+	    CONFIG_POSIX_API=y
+
+if UCHTTP
+
+config UCHTTP_RX_BUFFER_SIZE
+	int "Receive buffer size (bytes)"
+	default 1024
+	help
+	  Per-connection RX buffer. Must hold the largest request header block
+	  plus any non-streamed body.
+
+config UCHTTP_TX_BUFFER_SIZE
+	int "Transmit buffer size (bytes)"
+	default 1024
+
+config UCHTTP_MAX_ROUTES
+	int "Maximum number of routes"
+	default 16
+
+config UCHTTP_MAX_CONNECTIONS
+	int "Connection pool size (simultaneous clients)"
+	default 4
+	help
+	  Fixed, pre-allocated array of connection slots. Bounds RAM use on the
+	  device; new connections beyond this are dropped rather than queued.
+
+config UCHTTP_MAX_HEADER_BYTES
+	int "Maximum request header bytes (DoS guard)"
+	default 2048
+
+config UCHTTP_MAX_BODY_BYTES
+	int "Maximum buffered request body bytes (DoS guard)"
+	default 4096
+	help
+	  Does not apply to streaming (OTA) routes, which are never buffered.
+
+config UCHTTP_IDLE_TIMEOUT_MS
+	int "Idle read timeout in milliseconds (Slowloris guard)"
+	default 5000
+	help
+	  A connection whose peer stalls longer than this is dropped. 0 disables.
+
+endif # UCHTTP
