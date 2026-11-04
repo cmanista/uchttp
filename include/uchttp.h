@@ -8,6 +8,7 @@
 #include <array>
 
 #include "llhttp.h"
+#include "uchttp_ws.h"
 
 // ---------------------------------------------------------------------------
 // Configuration – tune for your target MCU
@@ -300,6 +301,11 @@ public:
 
     void reset() noexcept;
 
+    // Small per-response scratch storage for header values generated at
+    // run time (add_header() keeps views, not copies) — e.g. the
+    // Sec-WebSocket-Accept value. Valid until the response is sent/reset.
+    std::span<char> scratch() noexcept { return { scratch_, sizeof(scratch_) }; }
+
     std::string_view formatted() const noexcept;
 
     // send() must stay in the header: it is templated on Socket
@@ -328,16 +334,23 @@ public:
         }
 
         // Connection header is owned by the engine (requirement #3): tell the
-        // client whether we will keep the socket open or close it.
-        append(keep_alive_ ? "Connection: keep-alive\r\n"
-                           : "Connection: close\r\n");
-
-        if (!body_.empty()) {
-            append("Content-Length: ");
-            append_int(static_cast<int>(body_.size()));
-            append("\r\n");
+        // client whether we will keep the socket open or close it. A 101
+        // Switching Protocols reply (WebSocket, requirement #8) is special:
+        // "Connection: Upgrade" and no Content-Length (RFC 7230 3.3.2).
+        const bool upgrade = status_code_ == 101;
+        if (upgrade) {
+            append("Connection: Upgrade\r\n");
         } else {
-            append("Content-Length: 0\r\n");
+            append(keep_alive_ ? "Connection: keep-alive\r\n"
+                               : "Connection: close\r\n");
+
+            if (!body_.empty()) {
+                append("Content-Length: ");
+                append_int(static_cast<int>(body_.size()));
+                append("\r\n");
+            } else {
+                append("Content-Length: 0\r\n");
+            }
         }
 
         for (uint8_t i = 0; i < hdr_count_; ++i) {
@@ -349,7 +362,7 @@ public:
 
         append("\r\n");
 
-        if (!body_.empty()) {
+        if (!body_.empty() && !upgrade) {
             append(body_);
         }
 
@@ -392,6 +405,8 @@ private:
     void*      stream_ctx_   { nullptr };
     bool       hijacked_     { false };
 
+    char       scratch_[32] {};
+
     // Helpers called only from the templated send() above – must stay in header
     static const char* default_reason(int code) noexcept;
     void append(std::string_view s) noexcept;
@@ -419,6 +434,7 @@ struct Route {
     std::string_view path;
     HandlerFn        handler { nullptr };
     StreamHandlerFn  stream  { nullptr };   // non-null => streaming route
+    const ws::Handlers* ws   { nullptr };   // non-null => WebSocket endpoint (#8)
 };
 
 // ---------------------------------------------------------------------------
@@ -482,7 +498,15 @@ public:
     bool add_stream(HttpMethod method, std::string_view path,
                     StreamHandlerFn stream) noexcept {
         if (count_ >= MaxRoutes) return false;
-        routes_[count_++] = { method, path, nullptr, stream };
+        routes_[count_++] = { method, path, nullptr, stream, nullptr };
+        return true;
+    }
+
+    // Register a WebSocket endpoint (requirement #8). `handlers` is kept by
+    // pointer and must outlive the table (use static storage).
+    bool add_ws(std::string_view path, const ws::Handlers& handlers) noexcept {
+        if (count_ >= MaxRoutes) return false;
+        routes_[count_++] = { HttpMethod::GET, path, nullptr, nullptr, &handlers };
         return true;
     }
 
@@ -633,6 +657,60 @@ struct ParseState {
 const llhttp_settings_t& make_llhttp_settings() noexcept;
 
 // ---------------------------------------------------------------------------
+// WebSocket handshake (requirement #8)
+//
+// The upgrade is an ordinary HTTP request: it travels through the middleware
+// chain (auth, security headers, ...) and ends in upgrade_handler<Sha1>, which
+// validates the request and fills in the "101 Switching Protocols" reply. The
+// engine then sends it and hands the socket over to ws::serve(). The SHA-1
+// provider is a template parameter (ws::Sha1Concept) so a port can plug in
+// hardware acceleration.
+// ---------------------------------------------------------------------------
+
+namespace ws {
+
+// Case-insensitive header lookup (HTTP field names are case-insensitive;
+// HttpRequest::get_header() is an exact match).
+std::string_view find_header(const HttpRequest& req,
+                             std::string_view name) noexcept;
+
+// True if the comma separated header value `list` contains `token`.
+bool header_has_token(std::string_view list, std::string_view token,
+                      bool ignore_case) noexcept;
+
+// Validate an upgrade request. Returns 0 when acceptable (`key` set to the
+// Sec-WebSocket-Key), otherwise the HTTP status to answer with (426 / 400).
+int validate_handshake(const HttpRequest& req, std::string_view& key) noexcept;
+
+template <Sha1Concept Sha1>
+void upgrade_handler(const HttpRequest& req, HttpResponse& res) noexcept {
+    std::string_view key;
+    int status = validate_handshake(req, key);
+    if (status == 0) {
+        auto out = res.scratch();
+        size_t n = compute_accept<Sha1>(key, out);
+        if (n == 0) {
+            status = 500;
+        } else {
+            res.set_status(101);
+            res.add_header("Upgrade", "websocket");
+            res.add_header("Sec-WebSocket-Accept",
+                           std::string_view(out.data(), n));
+            return;
+        }
+    }
+    res.set_status(status);
+    if (status == 426) {
+        res.add_header("Upgrade", "websocket");
+        res.add_header("Sec-WebSocket-Version", "13");
+    }
+    res.set_content_type("text/plain");
+    res.set_body(status == 426 ? "Upgrade Required" : "Bad Request");
+}
+
+} // namespace ws
+
+// ---------------------------------------------------------------------------
 // HttpConnection  – fully templated, stays in header
 // ---------------------------------------------------------------------------
 
@@ -667,10 +745,11 @@ public:
     HttpConnection& operator=(const HttpConnection&) = delete;
     HttpConnection(HttpConnection&&)                 = default;
 
-    template <size_t MaxRoutes>
+    template <size_t MaxRoutes, typename WsTraits = ws::DefaultTraits>
     bool process(const RouteTable<MaxRoutes>& routes,
                  const MiddlewareFn* middleware = nullptr,
-                 size_t middleware_count = 0) noexcept {
+                 size_t middleware_count = 0,
+                 typename WsTraits::Allocator* ws_alloc = nullptr) noexcept {
         // One llhttp parser instance drives the whole connection; it natively
         // supports multiple messages back-to-back. on_message_complete returns
         // HPE_PAUSED so a single read() carrying the tail of one request and
@@ -710,14 +789,19 @@ public:
 
                     llhttp_errno_t err = llhttp_execute(&parser_, at, avail);
 
-                    if (err == HPE_PAUSED) {
+                    if (err == HPE_PAUSED || err == HPE_PAUSED_UPGRADE) {
                         // message_complete paused us; compute bytes used by
-                        // this request, then resume for the next one.
+                        // this request, then resume for the next one. An
+                        // "Upgrade:" request (WebSocket, requirement #8) is
+                        // reported by llhttp as HPE_PAUSED_UPGRADE.
                         const char* stop = llhttp_get_error_pos(&parser_);
                         consumed += static_cast<size_t>(
                             reinterpret_cast<const uint8_t*>(stop)
                             - (rx_buf_.data() + consumed));
-                        llhttp_resume(&parser_);
+                        if (err == HPE_PAUSED_UPGRADE)
+                            llhttp_resume_after_upgrade(&parser_);
+                        else
+                            llhttp_resume(&parser_);
                         break;
                     }
                     if (err != HPE_OK) {
@@ -790,7 +874,21 @@ public:
                 const Route* route = routes.find(state_.request.method,
                                                   state_.request.path,
                                                   state_.request);
-                if (route && route->handler) {
+                if (route && route->ws) {
+                    // WebSocket endpoint (requirement #8): the upgrade request
+                    // runs through the middleware chain like any other; only
+                    // if it ends in "101" is the connection handed over.
+                    MiddlewareChain chain(
+                        middleware, middleware_count,
+                        &ws::upgrade_handler<typename WsTraits::Sha1>);
+                    chain.run(state_.request, response_);
+                    if (response_.status() == 101 && !response_.hijacked()) {
+                        run_websocket<WsTraits>(*route->ws, ws_alloc,
+                                                consumed, buffered);
+                        return handled_any;   // session over -> close socket
+                    }
+                    (void)response_.send(socket_);   // rejected: plain HTTP reply
+                } else if (route && route->handler) {
                     MiddlewareChain chain(middleware, middleware_count,
                                           route->handler);
                     chain.run(state_.request, response_);
@@ -843,6 +941,68 @@ private:
                                     size_t len) noexcept {
         auto* sock = static_cast<Socket*>(ctx);
         return sock->write(std::span<const uint8_t>(data, len));
+    }
+
+    // --- WebSocket glue (requirement #8) -----------------------------------
+    static int ws_read_trampoline(void* ctx, uint8_t* buf, size_t len) noexcept {
+        return static_cast<Socket*>(ctx)->read(std::span<uint8_t>(buf, len));
+    }
+
+    static constexpr bool has_read_timeout =
+        requires(Socket& s, unsigned ms) { s.set_read_timeout(ms); };
+
+    static bool ws_timeout_trampoline(void* ctx, unsigned ms) noexcept {
+        if constexpr (has_read_timeout) {
+            return static_cast<Socket*>(ctx)->set_read_timeout(ms);
+        } else {
+            (void)ctx; (void)ms;
+            return false;
+        }
+    }
+
+    // Complete the upgrade whose "101" reply the middleware chain produced:
+    // gate -> buffer -> send 101 -> run the session -> release the buffer.
+    template <typename WsTraits>
+    void run_websocket(const ws::Handlers& h,
+                       typename WsTraits::Allocator* alloc,
+                       size_t consumed, size_t buffered) noexcept {
+        if (h.accept && !h.accept(state_.request)) {
+            send_error(403, "Forbidden", false);
+            return;
+        }
+        void* mem = alloc ? alloc->allocate(UCHTTP_WS_BUFFER_SIZE) : nullptr;
+        if (!mem) {
+            // No session memory left: refuse instead of growing the heap.
+            send_error(503, "Service Unavailable", false);
+            return;
+        }
+
+        if (!h.subprotocol.empty() &&
+            ws::header_has_token(
+                ws::find_header(state_.request, "Sec-WebSocket-Protocol"),
+                h.subprotocol, false)) {
+            response_.add_header("Sec-WebSocket-Protocol", h.subprotocol);
+        }
+
+        response_.set_keep_alive(false);
+        if (response_.send(socket_)) {
+            ws::Transport t;
+            t.read  = &ws_read_trampoline;
+            t.write = &raw_write_trampoline;
+            if constexpr (has_read_timeout) t.set_timeout = &ws_timeout_trampoline;
+            t.ctx   = &socket_;
+
+            // Bytes the HTTP parser already read behind the upgrade request.
+            std::span<const uint8_t> leftover(rx_buf_.data() + consumed,
+                                              buffered - consumed);
+            ws::serve(t, h, state_.request,
+                      std::span<uint8_t>(static_cast<uint8_t*>(mem),
+                                         UCHTTP_WS_BUFFER_SIZE),
+                      std::span<uint8_t>(
+                          reinterpret_cast<uint8_t*>(tx_buf_.data()), TxSize),
+                      leftover);
+        }
+        alloc->deallocate(mem, UCHTTP_WS_BUFFER_SIZE);
     }
 
     // Type-erased streaming-route resolver (requirement #7). Templated on the
@@ -945,7 +1105,8 @@ template <SocketConcept Socket,
           size_t RxSize    = UCHTTP_RX_BUFFER_SIZE,
           size_t TxSize    = UCHTTP_TX_BUFFER_SIZE,
           size_t MaxMiddleware = UCHTTP_MAX_MIDDLEWARE,
-          size_t MaxConns      = UCHTTP_MAX_CONNECTIONS>
+          size_t MaxConns      = UCHTTP_MAX_CONNECTIONS,
+          typename WsTraits    = ws::DefaultTraits>
 class HttpServer {
 public:
     HttpServer() = default;
@@ -962,6 +1123,17 @@ public:
                    HandlerFn handler) noexcept {
         return routes_.add(method, path, handler);
     }
+
+    // WebSocket endpoint (requirement #8). `handlers` is stored by pointer and
+    // must outlive the server (static storage). Middleware registered with
+    // use() also guards the upgrade request.
+    bool websocket(std::string_view path, const ws::Handlers& handlers) noexcept {
+        return routes_.add_ws(path, handlers);
+    }
+
+    // Platform hook: the allocator that supplies the per-session WebSocket
+    // buffer (e.g. to initialise a slab allocator before run()).
+    typename WsTraits::Allocator& ws_allocator() noexcept { return ws_alloc_; }
 
     bool get (std::string_view path, HandlerFn h) noexcept { return add_route(HttpMethod::GET,     path, h); }
     bool post(std::string_view path, HandlerFn h) noexcept { return add_route(HttpMethod::POST,    path, h); }
@@ -995,7 +1167,7 @@ public:
                 // dropped (closed by its destructor) so the client backs off.
                 continue;
             }
-            conn->process(routes_, middleware_, mw_count_);
+            conn->template process<MaxRoutes, WsTraits>(routes_, middleware_, mw_count_, &ws_alloc_);
             pool_.release(conn);
         }
         // Graceful shutdown: close anything still active on the way out.
@@ -1010,7 +1182,7 @@ public:
 
         auto* conn = pool_.acquire(static_cast<Socket&&>(sock));
         if (!conn) return;                 // pool full -> drop
-        conn->process(routes_, middleware_, mw_count_);
+        conn->template process<MaxRoutes, WsTraits>(routes_, middleware_, mw_count_, &ws_alloc_);
         pool_.release(conn);
     }
 
@@ -1034,6 +1206,7 @@ private:
     MiddlewareFn                                     middleware_[MaxMiddleware] {};
     size_t                                           mw_count_ { 0 };
     ConnectionPool<Socket, MaxConns, RxSize, TxSize> pool_;
+    typename WsTraits::Allocator                     ws_alloc_ {};
     bool                                             running_ { false };
 };
 

@@ -1,0 +1,19 @@
+mainmenu "uchttp WebSocket sample"
+
+config APP_SERVER_THREADS
+	int "Server threads (= simultaneous WebSocket clients)"
+	default 2
+	range 1 8
+	help
+	  Every thread runs its own HttpServer and serves one connection at a
+	  time; a WebSocket keeps its connection for as long as it lives.
+
+config APP_WIFI_SSID
+	string "WiFi SSID to join at boot (empty: connect from the shell)"
+	default ""
+
+config APP_WIFI_PSK
+	string "WiFi WPA2 passphrase"
+	default ""
+
+source "Kconfig.zephyr"

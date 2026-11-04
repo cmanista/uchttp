@@ -1,4 +1,4 @@
-# uchttp Zephyr module build (Stage 1: HTTP, Stage 2: HTTPS/TLS).
+# uchttp Zephyr module build (Stage 1: HTTP, Stage 2: HTTPS/TLS, WebSocket).
 # Kept separate from the host CMakeLists.txt so the plain host/CMake build is
 # untouched. Enabled by CONFIG_UCHTTP.
 
@@ -15,6 +15,20 @@ if(CONFIG_UCHTTP)
     ${UCHTTP_ROOT}/src/uchttp_security.cpp
     ${UCHTTP_ROOT}/src/uchttp_app_middleware.cpp
     ${UCHTTP_ROOT}/src/port/zephyr_socket.cpp
+  )
+
+  # WebSocket (requirement #8): platform independent core. Small enough to be
+  # always built; unused code is dropped by --gc-sections.
+  zephyr_library_sources(
+    ${UCHTTP_ROOT}/src/uchttp_ws.cpp
+    ${UCHTTP_ROOT}/src/uchttp_ws_session.cpp
+    ${UCHTTP_ROOT}/src/uchttp_ws_handshake.cpp
+  )
+
+  # SHA-1 for the handshake through PSA Crypto (hardware accelerated where the
+  # PSA driver supports it).
+  zephyr_library_sources_ifdef(CONFIG_UCHTTP_WS_SHA1_PSA
+    ${UCHTTP_ROOT}/src/port/zephyr_psa_sha1.cpp
   )
 
   # Stage 2: HTTPS/TLS port (ZephyrTlsAcceptor / ZephyrTlsCredentials) over
@@ -50,6 +64,11 @@ if(CONFIG_UCHTTP)
     UCHTTP_MAX_HEADER_BYTES=${CONFIG_UCHTTP_MAX_HEADER_BYTES}
     UCHTTP_MAX_BODY_BYTES=${CONFIG_UCHTTP_MAX_BODY_BYTES}
     UCHTTP_IDLE_TIMEOUT_MS=${CONFIG_UCHTTP_IDLE_TIMEOUT_MS}
+    UCHTTP_WS_MAX_MESSAGE_SIZE=${CONFIG_UCHTTP_WS_MAX_MESSAGE_SIZE}
+    UCHTTP_WS_MAX_FRAME_SIZE=${CONFIG_UCHTTP_WS_MAX_FRAME_SIZE}
+    UCHTTP_WS_MAX_SESSIONS=${CONFIG_UCHTTP_WS_MAX_SESSIONS}
+    UCHTTP_WS_IDLE_INTERVAL_MS=${CONFIG_UCHTTP_WS_IDLE_INTERVAL_MS}
+    UCHTTP_WS_PING_INTERVAL_MS=${CONFIG_UCHTTP_WS_PING_INTERVAL_MS}
   )
 
 endif()

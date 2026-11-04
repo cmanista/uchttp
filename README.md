@@ -108,6 +108,7 @@ Zero heap allocations, zero-copy parsing, CRTP-based socket abstraction.
 | **Static routing** | `RouteTable<N>` is a fixed array; size is a compile-time constant |
 | **Handler signature** | `void(const HttpRequest&, HttpResponse&)` — plain function pointer |
 | **Middleware** | Chain of Responsibility; `void(req, res, MiddlewareChain&)` fn ptrs, fixed array |
+| **WebSocket** | RFC 6455 endpoints as routes; pluggable SHA-1 and buffer allocator |
 | **Portability** | Core library (`uchttp.h`) has no OS or POSIX dependencies |
 
 ## Quick start (Linux)
@@ -392,6 +393,79 @@ frame (multi-line data is split into several `data:` lines). Once the handler
 streams its own bytes it "hijacks" the response, so the engine does not append
 a buffered reply. Both work unchanged over TLS (`TlsSocket`).
 
+## WebSocket (RFC 6455)
+
+`#include "uchttp.h"` (pulls in `uchttp_ws.h`). A WebSocket endpoint is a
+route; the upgrade request goes through the middleware chain like any other
+request (auth, security headers), and only a `101` reply hands the socket
+over to the WebSocket session (requirement #8).
+
+```cpp
+void on_message(uchttp::ws::Session& s, uchttp::ws::Opcode type,
+                std::span<const uint8_t> data) {
+    if (type == uchttp::ws::Opcode::Text)
+        s.send_text({reinterpret_cast<const char*>(data.data()), data.size()});
+    else
+        s.send_binary(data);
+}
+void on_idle(uchttp::ws::Session& s) { s.send_text(R"({"temp":23.5})"); } // every idle tick
+
+static uchttp::ws::Handlers ws_handlers {
+    .on_message = on_message,
+    .on_idle    = on_idle,
+};
+server.websocket("/ws", ws_handlers);       // path parameters work too: "/ws/{id}"
+```
+
+API is callback based (plain function pointers, no `std::function`, no
+virtuals): `on_open`, `on_message` (whole message, fragments reassembled,
+text validated as UTF-8), `on_close` (exactly once, with the peer's code or
+1006), `on_idle` (read timeout tick - periodic server push without an extra
+thread), `accept` (gate before the `101`, e.g. an `Origin` check -> 403),
+`subprotocol`, and `user` (context returned by `Session::user()`). The
+session sends with `send_text()` / `send_binary()` / `ping()` / `close()`.
+
+What the engine does:
+
+| Area | Behaviour |
+|---|---|
+| Handshake | `Upgrade` / `Connection` / `Sec-WebSocket-Version: 13` / `Sec-WebSocket-Key` validated (names case-insensitive); `426` with hints or `400` otherwise; `Sec-WebSocket-Accept` = base64(SHA-1(key + GUID)) |
+| Framing | masked client frames required, RSV bits and reserved opcodes rejected, minimal length encoding enforced, control frames <= 125 B and unfragmented, Ping -> Pong, close codes validated |
+| Limits | `UCHTTP_WS_MAX_FRAME_SIZE` checked from the header alone (a 4 GiB frame is refused without reading it), `UCHTTP_WS_MAX_MESSAGE_SIZE` after reassembly -> close 1009 |
+| Keep-alive | Ping after `UCHTTP_WS_PING_INTERVAL_MS` of silence, peer dropped after the same time again (default 15 s / 30 s) |
+| Memory | one session buffer per connection from the allocator, frames parsed and reassembled in place; small outgoing frames coalesced into the TX buffer (one write) |
+
+### Platform hooks
+
+Both are compile-time plug-ins bundled in `ws::Traits<Sha1, Allocator>` and
+given to `HttpServer` as its last template parameter (default
+`ws::DefaultTraits`):
+
+| Concept | Default | Zephyr port |
+|---|---|---|
+| `ws::Sha1Concept` (`start/update/finish`) | `ws::SoftSha1` (portable) | `ZephyrPsaSha1` - PSA Crypto, HW-accelerated where the PSA driver supports SHA-1 |
+| `ws::AllocatorConcept` (`allocate/deallocate`) | `ws::StaticAllocator<N, Size>` (static storage) | `ZephyrSlabAllocator<N, Size>` - `k_mem_slab` |
+
+```cpp
+using WsTraits = uchttp::ws::Traits<MySha1, MyAllocator>;
+uchttp::HttpServer<MySocket, UCHTTP_MAX_ROUTES, UCHTTP_RX_BUFFER_SIZE,
+                   UCHTTP_TX_BUFFER_SIZE, UCHTTP_MAX_MIDDLEWARE,
+                   UCHTTP_MAX_CONNECTIONS, WsTraits> server;
+```
+
+An exhausted allocator refuses the upgrade with `503`. `HttpServer` serves one
+connection at a time and a WebSocket keeps its connection, so serve N
+concurrent clients with N server instances (threads) sharing one acceptor -
+see the examples.
+
+### Host demo
+
+```bash
+./build/uchttp_ws_server                  # 4 worker threads, port 8080
+# browser: http://localhost:8080/  (JS client)   or:
+wscat -c ws://localhost:8080/ws           # echo; "close" closes; telemetry every 1 s
+```
+
 ## Reliability & resource management
 
 On an MCU the socket/descriptor pool is tiny, so uchttp never allocates a
@@ -438,6 +512,7 @@ src/port/zephyr_socket.{h,cpp}   ZephyrSocket + ZephyrAcceptor (zsock_*/net_* AP
 src/port/zephyr_tls.{h,cpp}      ZephyrTlsAcceptor + ZephyrTlsCredentials (TLS, Stage 2)
 samples/zephyr/http_server/      runnable HTTP sample (HttpServer<ZephyrSocket>)
 samples/zephyr/https_server/     runnable HTTPS sample (TLS, Stage 2)
+samples/zephyr/ws_server/        runnable WebSocket sample
 ```
 
 The core (`uchttp.h`) is unchanged — only the socket/acceptor port differs.
@@ -528,25 +603,73 @@ The sample embeds a self-signed demo certificate in
 command noted in that header). Both `native_sim` and `frdm_rw612` HTTPS builds
 are verified against Zephyr 4.5 / SDK 1.0.
 
+### WebSocket on Zephyr
+
+The WebSocket core is always part of the module; the Zephyr plug-ins live in
+`src/port/zephyr_ws.h` (`ZephyrSlabAllocator`) and
+`src/port/zephyr_psa_sha1.{h,cpp}` (`ZephyrPsaSha1`, enabled by
+`CONFIG_UCHTTP_WS_SHA1_PSA=y`). Tunables: `CONFIG_UCHTTP_WS_MAX_MESSAGE_SIZE`,
+`..._MAX_FRAME_SIZE`, `..._IDLE_INTERVAL_MS`, `..._PING_INTERVAL_MS`,
+`..._MAX_SESSIONS`.
+
+`samples/zephyr/ws_server` serves the demo page at `/` and `/ws` (echo, a
+telemetry message every second, `close` to close) with
+`CONFIG_APP_SERVER_THREADS` (default 2) simultaneous clients:
+
+```bash
+west build -p always -b frdm_rw612 samples/zephyr/ws_server \
+    -- -DZEPHYR_EXTRA_MODULES=$(pwd)
+west flash
+# console:  wifi connect -s <SSID> -k 1 -p <PASSWORD>
+wscat -c ws://<device-ip>:8080/ws
+```
+
+To join WiFi at boot instead, put `CONFIG_APP_WIFI_SSID="..."` and
+`CONFIG_APP_WIFI_PSK="..."` into `samples/zephyr/ws_server/local.conf`
+(git-ignored) and add `-DEXTRA_CONF_FILE=local.conf` to the build.
+
+Notes from bring-up on FRDM-RW612:
+
+- `CONFIG_UCHTTP` selects `CONFIG_NET_CONTEXT_RCVTIMEO`: without it Zephyr
+  silently ignores `SO_RCVTIMEO`, which disables both the HTTP idle timeout
+  (Slowloris guard) and the WebSocket idle tick / keep-alive.
+- Enabling PSA Crypto also enables `CONFIG_NET_TCP_ISN_RFC6528` (a SHA-256 per
+  incoming SYN, computed in the network RX thread). The default 1500 B `rx_q`
+  stack overflows; the sample sets `CONFIG_NET_RX_STACK_SIZE=4096`.
+
+Verified on the board: python `websockets` and `wscat` clients (echo of
+text/binary/UTF-8/fragmented/1000 B messages, ping/pong, 1 s push, close
+handshake), protocol-violation tests (1002/1007/1009), dead-peer drop after
+Ping (15 s / 30 s), two parallel sessions with a third queued until a slot
+frees. Peak stack use of a server thread: ~2.2 KB of 6 KB.
+
 ## File map
 
 ```
 include/uchttp.h          Core library (engine, routing, middleware, pool)
 include/uchttp_security.h Auth + security-headers middleware, secure_compare
 include/uchttp_app_middleware.h  Cache-Control / ETag / Accept-Encoding / X-Request-ID
+include/uchttp_ws.h       WebSocket core: codec, Session, Handlers, Sha1/Allocator concepts
 include/uchttp_tls.h      TLS abstraction (TlsSocket / TlsAcceptor)
 include/openssl_tls.h     OpenSSL backend (host)
 include/wolfssl_tls.h     wolfSSL backend (embedded)
 src/linux_socket.h        POSIX LinuxSocket + LinuxAcceptor
 src/linux_server.cpp      Example HTTP server on localhost
 src/linux_https_server.cpp Example HTTPS server (OpenSSL)
+src/linux_ws_server.cpp   Example WebSocket server (4 worker threads)
+src/uchttp_ws*.cpp        WebSocket codec + SHA-1, session loop, handshake
+src/examples/ws_demo.h    Demo page + telemetry shared by the WS examples
 src/port/zephyr_socket.{h,cpp}  Zephyr ZephyrSocket + ZephyrAcceptor
 src/port/zephyr_tls.{h,cpp}     Zephyr ZephyrTlsAcceptor + ZephyrTlsCredentials (TLS)
+src/port/zephyr_ws.h            Zephyr ZephyrSlabAllocator (k_mem_slab) for WebSocket
+src/port/zephyr_psa_sha1.{h,cpp} Zephyr ZephyrPsaSha1 (PSA Crypto SHA-1)
 zephyr/                   Zephyr module (module.yml, CMakeLists.txt, Kconfig)
 samples/zephyr/http_server/     Zephyr HTTP sample (HttpServer<ZephyrSocket>)
 samples/zephyr/https_server/    Zephyr HTTPS sample (TLS, Mbed TLS / PSA Crypto)
+samples/zephyr/ws_server/       Zephyr WebSocket sample (echo + telemetry)
 tests/mock_socket.h       In-memory socket for unit tests
-tests/test_uchttp.cpp     109 gtest unit tests
+tests/test_uchttp.cpp     109 gtest unit tests (HTTP engine)
+tests/test_uchttp_ws.cpp  106 gtest unit tests (WebSocket)
 CMakeLists.txt            Build system
 third_party/llhttp/       llhttp v9.4.3
 ```

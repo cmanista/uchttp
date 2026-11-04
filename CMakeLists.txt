@@ -26,6 +26,9 @@ add_library(uchttp STATIC
     src/uchttp.cpp
     src/uchttp_security.cpp
     src/uchttp_app_middleware.cpp
+    src/uchttp_ws.cpp
+    src/uchttp_ws_session.cpp
+    src/uchttp_ws_handshake.cpp
 )
 target_include_directories(uchttp PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -102,6 +105,16 @@ add_executable(uchttp_server
 )
 target_link_libraries(uchttp_server PRIVATE linux_socket)
 
+# WebSocket demo (requirement #8): echo + server push, several worker threads.
+find_package(Threads REQUIRED)
+add_executable(uchttp_ws_server
+    src/linux_ws_server.cpp
+)
+target_include_directories(uchttp_ws_server PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(uchttp_ws_server PRIVATE linux_socket Threads::Threads)
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -110,7 +123,7 @@ enable_testing()
 find_package(GTest QUIET)
 
 if(GTest_FOUND)
-    add_executable(uchttp_tests tests/test_uchttp.cpp)
+    add_executable(uchttp_tests tests/test_uchttp.cpp tests/test_uchttp_ws.cpp)
     target_include_directories(uchttp_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
     )
@@ -129,7 +142,7 @@ else()
     set(BUILD_GMOCK   OFF CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(googletest)
 
-    add_executable(uchttp_tests tests/test_uchttp.cpp)
+    add_executable(uchttp_tests tests/test_uchttp.cpp tests/test_uchttp_ws.cpp)
     target_include_directories(uchttp_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
     )

@@ -1,0 +1,3 @@
+
+# Local build settings (WiFi credentials etc.)
+samples/**/local.conf

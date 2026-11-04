@@ -1,8 +1,12 @@
-# uchttp — microcontroller HTTP server, Zephyr module (Stage 1: HTTP, Stage 2: HTTPS/TLS)
+# uchttp — microcontroller HTTP server, Zephyr module (Stage 1: HTTP, Stage 2: HTTPS/TLS, WebSocket)
 
 menuconfig UCHTTP
 	bool "uchttp HTTP server"
 	depends on CPP
+	# Socket read timeouts (SO_RCVTIMEO) are a no-op without this. uchttp
+	# relies on them for the Slowloris/idle guard (UCHTTP_IDLE_TIMEOUT_MS)
+	# and for the WebSocket idle tick / keep-alive.
+	select NET_CONTEXT_RCVTIMEO if NETWORKING
 	help
 	  Lightweight HTTP/1.1 server for microcontrollers. Provides the core
 	  engine plus the Zephyr BSD-socket port (ZephyrSocket / ZephyrAcceptor).
@@ -72,5 +76,56 @@ config UCHTTP_TLS
 	  uchttp::ZephyrTlsCredentials before starting the acceptor. You will
 	  typically also want to raise the TLS buffer sizes in your prj.conf,
 	  e.g. CONFIG_MBEDTLS_HEAP_SIZE and the content-length limits.
+
+config UCHTTP_WS_MAX_MESSAGE_SIZE
+	int "WebSocket: largest accepted message (bytes)"
+	default 1024
+	help
+	  Largest data message, after reassembly of fragments. A bigger one is
+	  refused with close code 1009. Together with the control-frame reserve
+	  this is the size of the per-session buffer handed out by the WebSocket
+	  allocator (ws::AllocatorConcept, e.g. ZephyrSlabAllocator).
+
+config UCHTTP_WS_MAX_FRAME_SIZE
+	int "WebSocket: largest accepted frame payload (bytes)"
+	default UCHTTP_WS_MAX_MESSAGE_SIZE
+	help
+	  Frame size limit. A frame announcing more is rejected (1009) as soon
+	  as its header was parsed, before any of the payload is read.
+
+config UCHTTP_WS_MAX_SESSIONS
+	int "WebSocket: buffers in the default static allocator"
+	default 1
+	help
+	  Only used by ws::StaticAllocator. HttpServer serves one connection at
+	  a time, so one buffer per server is enough.
+
+config UCHTTP_WS_IDLE_INTERVAL_MS
+	int "WebSocket: default idle tick (ms)"
+	default 1000
+	help
+	  Read timeout of an upgraded connection; on every expiry the on_idle()
+	  callback runs (periodic server push) and the keep-alive is advanced.
+
+config UCHTTP_WS_PING_INTERVAL_MS
+	int "WebSocket: keep-alive Ping after this much silence (ms)"
+	default 15000
+	help
+	  A silent peer is sent a Ping and dropped if it stays silent for the
+	  same time again.
+
+config UCHTTP_WS_SHA1_PSA
+	bool "WebSocket: compute Sec-WebSocket-Accept with PSA Crypto"
+	select PSA_CRYPTO
+	select PSA_WANT_ALG_SHA_1
+	help
+	  Builds ZephyrPsaSha1, a ws::Sha1Concept provider on top of the PSA
+	  Crypto API. On SoCs whose PSA driver implements SHA-1 in hardware the
+	  handshake hash is accelerated; otherwise Mbed TLS' software SHA-1 runs.
+	  Without it use the portable ws::SoftSha1.
+
+	  Note: enabling PSA Crypto also enables NET_TCP_ISN_RFC6528 (TCP
+	  sequence numbers hashed with SHA-256 in the network RX thread). Raise
+	  CONFIG_NET_RX_STACK_SIZE (e.g. 4096) or the rx_q thread may overflow.
 
 endif # UCHTTP
