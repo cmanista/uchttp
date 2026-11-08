@@ -1,6 +1,6 @@
 # Platform ports and test doubles
 
-Źródło: `src/linux_socket.h`, `src/port/zephyr_*.h`, `tests/mock_socket.h`.
+Źródło: `src/port/linux/linux_socket.h`, `src/port/zephyr/zephyr_*.h`, `tests/mock_socket.h`.
 [← indeks](../../class_diagram.md)
 
 ```mermaid

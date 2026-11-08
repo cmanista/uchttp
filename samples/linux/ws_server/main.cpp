@@ -28,7 +28,7 @@
 
 #include "uchttp.h"
 #include "linux_socket.h"
-#include "examples/ws_demo.h"
+#include "ws_demo.h"
 
 static uchttp::LinuxAcceptor *g_acceptor = nullptr;
 

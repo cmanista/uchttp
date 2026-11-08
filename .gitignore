@@ -1,3 +1,6 @@
 
 # Local build settings (WiFi credentials etc.)
 samples/**/local.conf
+build/
+cscope.out
+tags

@@ -1,7 +1,7 @@
 # WebSocket (RFC 6455)
 
 Źródło: `include/uchttp_ws.h`, `include/uchttp.h` (handshake),
-`src/uchttp_ws*.cpp`, `src/port/zephyr_ws.h`, `src/port/zephyr_psa_sha1.h`.
+`src/uchttp_ws*.cpp`, `src/port/zephyr/zephyr_ws.h`, `src/port/zephyr/zephyr_psa_sha1.h`.
 [← indeks](../../class_diagram.md)
 
 ```mermaid

@@ -39,10 +39,10 @@ target_link_libraries(uchttp PUBLIC llhttp)
 # linux_socket  – static library (POSIX only, not for MCU targets)
 # ---------------------------------------------------------------------------
 add_library(linux_socket STATIC
-    src/linux_socket.cpp
+    src/port/linux/linux_socket.cpp
 )
 target_include_directories(linux_socket PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/port/linux
 )
 target_link_libraries(linux_socket PUBLIC uchttp)
 
@@ -57,14 +57,14 @@ if(OpenSSL_FOUND)
     )
     target_include_directories(uchttp_tls_openssl PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/port/linux
     )
     target_link_libraries(uchttp_tls_openssl
         PUBLIC uchttp linux_socket OpenSSL::SSL OpenSSL::Crypto)
     message(STATUS "uchttp: OpenSSL TLS backend ENABLED (${OPENSSL_VERSION})")
 
     # Example HTTPS server using the OpenSSL backend.
-    add_executable(uchttp_https_server src/linux_https_server.cpp)
+    add_executable(uchttp_https_server samples/linux/https_server/main.cpp)
     target_link_libraries(uchttp_https_server PRIVATE
         uchttp_tls_openssl linux_socket)
 else()
@@ -84,7 +84,7 @@ if(UCHTTP_WITH_WOLFSSL)
         )
         target_include_directories(uchttp_tls_wolfssl PUBLIC
             ${CMAKE_CURRENT_SOURCE_DIR}/include
-            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/port/linux
             ${WOLFSSL_INCLUDE_DIRS}
         )
         target_link_libraries(uchttp_tls_wolfssl
@@ -101,17 +101,17 @@ endif()
 # Linux demo server
 # ---------------------------------------------------------------------------
 add_executable(uchttp_server
-    src/linux_server.cpp
+    samples/linux/http_server/main.cpp
 )
 target_link_libraries(uchttp_server PRIVATE linux_socket)
 
 # WebSocket demo (requirement #8): echo + server push, several worker threads.
 find_package(Threads REQUIRED)
 add_executable(uchttp_ws_server
-    src/linux_ws_server.cpp
+    samples/linux/ws_server/main.cpp
 )
 target_include_directories(uchttp_ws_server PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/samples/common
 )
 target_link_libraries(uchttp_ws_server PRIVATE linux_socket Threads::Threads)
 

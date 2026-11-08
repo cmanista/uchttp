@@ -338,7 +338,7 @@ server.run(tls);
 ```
 
 Both certificate and pre-shared-key (PSK) authentication are supported; TLS 1.2
-is the minimum protocol version. See `src/linux_https_server.cpp` for a runnable
+is the minimum protocol version. See `samples/linux/https_server/main.cpp` for a runnable
 example:
 
 ```bash
@@ -508,8 +508,8 @@ build is kept separate from the host CMake build:
 zephyr/module.yml      declares the module (build cmake + Kconfig)
 zephyr/CMakeLists.txt  zephyr_library() — core + middleware + port + llhttp
 zephyr/Kconfig         CONFIG_UCHTTP, CONFIG_UCHTTP_TLS and CONFIG_UCHTTP_* tunables
-src/port/zephyr_socket.{h,cpp}   ZephyrSocket + ZephyrAcceptor (zsock_*/net_* API)
-src/port/zephyr_tls.{h,cpp}      ZephyrTlsAcceptor + ZephyrTlsCredentials (TLS, Stage 2)
+src/port/zephyr/zephyr_socket.{h,cpp}   ZephyrSocket + ZephyrAcceptor (zsock_*/net_* API)
+src/port/zephyr/zephyr_tls.{h,cpp}      ZephyrTlsAcceptor + ZephyrTlsCredentials (TLS, Stage 2)
 samples/zephyr/http_server/      runnable HTTP sample (HttpServer<ZephyrSocket>)
 samples/zephyr/https_server/     runnable HTTPS sample (TLS, Stage 2)
 samples/zephyr/ws_server/        runnable WebSocket sample
@@ -606,8 +606,8 @@ are verified against Zephyr 4.5 / SDK 1.0.
 ### WebSocket on Zephyr
 
 The WebSocket core is always part of the module; the Zephyr plug-ins live in
-`src/port/zephyr_ws.h` (`ZephyrSlabAllocator`) and
-`src/port/zephyr_psa_sha1.{h,cpp}` (`ZephyrPsaSha1`, enabled by
+`src/port/zephyr/zephyr_ws.h` (`ZephyrSlabAllocator`) and
+`src/port/zephyr/zephyr_psa_sha1.{h,cpp}` (`ZephyrPsaSha1`, enabled by
 `CONFIG_UCHTTP_WS_SHA1_PSA=y`). Tunables: `CONFIG_UCHTTP_WS_MAX_MESSAGE_SIZE`,
 `..._MAX_FRAME_SIZE`, `..._IDLE_INTERVAL_MS`, `..._PING_INTERVAL_MS`,
 `..._MAX_SESSIONS`.
@@ -653,17 +653,17 @@ include/uchttp_ws.h       WebSocket core: codec, Session, Handlers, Sha1/Allocat
 include/uchttp_tls.h      TLS abstraction (TlsSocket / TlsAcceptor)
 include/openssl_tls.h     OpenSSL backend (host)
 include/wolfssl_tls.h     wolfSSL backend (embedded)
-src/linux_socket.h        POSIX LinuxSocket + LinuxAcceptor
-src/linux_server.cpp      Example HTTP server on localhost
-src/linux_https_server.cpp Example HTTPS server (OpenSSL)
-src/linux_ws_server.cpp   Example WebSocket server (4 worker threads)
 src/uchttp_ws*.cpp        WebSocket codec + SHA-1, session loop, handshake
-src/examples/ws_demo.h    Demo page + telemetry shared by the WS examples
-src/port/zephyr_socket.{h,cpp}  Zephyr ZephyrSocket + ZephyrAcceptor
-src/port/zephyr_tls.{h,cpp}     Zephyr ZephyrTlsAcceptor + ZephyrTlsCredentials (TLS)
-src/port/zephyr_ws.h            Zephyr ZephyrSlabAllocator (k_mem_slab) for WebSocket
-src/port/zephyr_psa_sha1.{h,cpp} Zephyr ZephyrPsaSha1 (PSA Crypto SHA-1)
+src/port/linux/linux_socket.{h,cpp}  POSIX LinuxSocket + LinuxAcceptor
+src/port/zephyr/zephyr_socket.{h,cpp}  Zephyr ZephyrSocket + ZephyrAcceptor
+src/port/zephyr/zephyr_tls.{h,cpp}     Zephyr ZephyrTlsAcceptor + ZephyrTlsCredentials (TLS)
+src/port/zephyr/zephyr_ws.h            Zephyr ZephyrSlabAllocator (k_mem_slab) for WebSocket
+src/port/zephyr/zephyr_psa_sha1.{h,cpp} Zephyr ZephyrPsaSha1 (PSA Crypto SHA-1)
 zephyr/                   Zephyr module (module.yml, CMakeLists.txt, Kconfig)
+samples/common/ws_demo.h        Demo page + telemetry shared by the WS examples
+samples/linux/http_server/      Example HTTP server on localhost
+samples/linux/https_server/     Example HTTPS server (OpenSSL)
+samples/linux/ws_server/        Example WebSocket server (4 worker threads)
 samples/zephyr/http_server/     Zephyr HTTP sample (HttpServer<ZephyrSocket>)
 samples/zephyr/https_server/    Zephyr HTTPS sample (TLS, Mbed TLS / PSA Crypto)
 samples/zephyr/ws_server/       Zephyr WebSocket sample (echo + telemetry)

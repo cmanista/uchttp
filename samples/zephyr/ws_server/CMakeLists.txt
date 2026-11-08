@@ -10,7 +10,7 @@ target_sources(app PRIVATE src/main.cpp)
 # ZEPHYR_UCHTTP_MODULE_DIR is set by Zephyr's module system.
 target_include_directories(app PRIVATE
   ${ZEPHYR_UCHTTP_MODULE_DIR}/include
-  ${ZEPHYR_UCHTTP_MODULE_DIR}/src/port
-  ${ZEPHYR_UCHTTP_MODULE_DIR}/src/examples
+  ${ZEPHYR_UCHTTP_MODULE_DIR}/src/port/zephyr
+  ${ZEPHYR_UCHTTP_MODULE_DIR}/samples/common
   ${ZEPHYR_UCHTTP_MODULE_DIR}/third_party/llhttp/include
 )

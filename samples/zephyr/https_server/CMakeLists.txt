@@ -10,6 +10,6 @@ target_sources(app PRIVATE src/main.cpp)
 # is set by Zephyr's module system to the root of the uchttp module.
 target_include_directories(app PRIVATE
   ${ZEPHYR_UCHTTP_MODULE_DIR}/include
-  ${ZEPHYR_UCHTTP_MODULE_DIR}/src/port
+  ${ZEPHYR_UCHTTP_MODULE_DIR}/src/port/zephyr
   ${ZEPHYR_UCHTTP_MODULE_DIR}/third_party/llhttp/include
 )

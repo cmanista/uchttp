@@ -14,7 +14,7 @@ if(CONFIG_UCHTTP)
     ${UCHTTP_ROOT}/src/uchttp.cpp
     ${UCHTTP_ROOT}/src/uchttp_security.cpp
     ${UCHTTP_ROOT}/src/uchttp_app_middleware.cpp
-    ${UCHTTP_ROOT}/src/port/zephyr_socket.cpp
+    ${UCHTTP_ROOT}/src/port/zephyr/zephyr_socket.cpp
   )
 
   # WebSocket (requirement #8): platform independent core. Small enough to be
@@ -28,14 +28,14 @@ if(CONFIG_UCHTTP)
   # SHA-1 for the handshake through PSA Crypto (hardware accelerated where the
   # PSA driver supports it).
   zephyr_library_sources_ifdef(CONFIG_UCHTTP_WS_SHA1_PSA
-    ${UCHTTP_ROOT}/src/port/zephyr_psa_sha1.cpp
+    ${UCHTTP_ROOT}/src/port/zephyr/zephyr_psa_sha1.cpp
   )
 
   # Stage 2: HTTPS/TLS port (ZephyrTlsAcceptor / ZephyrTlsCredentials) over
   # Zephyr's native secure sockets (Mbed TLS / PSA Crypto). Only built when
   # CONFIG_UCHTTP_TLS is enabled so HTTP-only builds stay lean.
   zephyr_library_sources_ifdef(CONFIG_UCHTTP_TLS
-    ${UCHTTP_ROOT}/src/port/zephyr_tls.cpp
+    ${UCHTTP_ROOT}/src/port/zephyr/zephyr_tls.cpp
   )
 
   # llhttp parser (C).
@@ -48,7 +48,7 @@ if(CONFIG_UCHTTP)
   zephyr_include_directories(
     ${UCHTTP_ROOT}/include
     ${UCHTTP_ROOT}/src
-    ${UCHTTP_ROOT}/src/port
+    ${UCHTTP_ROOT}/src/port/zephyr
     ${LLHTTP_DIR}/include
   )
 
