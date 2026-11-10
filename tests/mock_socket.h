@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cezary Manista
+
 #pragma once
 
 // mock_socket.h – in-memory socket for unit tests.

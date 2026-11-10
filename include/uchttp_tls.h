@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cezary Manista
+
 #pragma once
 
 // uchttp_tls.h — TLS/HTTPS abstraction (requirement #4).

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cezary Manista
+
 // test_uchttp.cpp – gtest unit tests for uchttp
 //
 // Tests cover:

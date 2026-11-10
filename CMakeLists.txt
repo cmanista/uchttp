@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Cezary Manista
+
 cmake_minimum_required(VERSION 3.20)
 project(uchttp VERSION 0.1.0 LANGUAGES C CXX)
 

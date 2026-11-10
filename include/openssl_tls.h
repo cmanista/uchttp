@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cezary Manista
+
 #pragma once
 
 // openssl_tls.h — OpenSSL TLS backend for host builds (requirement #4).

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cezary Manista
+
 #include "linux_socket.h"
 
 #include <sys/types.h>

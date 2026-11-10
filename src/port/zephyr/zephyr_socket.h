@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cezary Manista
+
 #pragma once
 
 // zephyr_socket.h — Zephyr BSD-socket implementation of uchttp::SocketConcept

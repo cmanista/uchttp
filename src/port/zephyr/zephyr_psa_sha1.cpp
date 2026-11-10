@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cezary Manista
+
 #include "zephyr_psa_sha1.h"
 
 namespace uchttp {

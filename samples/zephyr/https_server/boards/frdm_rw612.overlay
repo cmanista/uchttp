@@ -1,6 +1,7 @@
 /*
  * FRDM-RW612 overlay for the uchttp WiFi sample.
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Cezary Manista
  */
 
 &standby {

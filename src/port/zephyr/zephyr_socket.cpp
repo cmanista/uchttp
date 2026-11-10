@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cezary Manista
+
 #include "zephyr_socket.h"
 
 // Use Zephyr's native socket API (zsock_* / net_*) rather than the POSIX

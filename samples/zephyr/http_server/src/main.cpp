@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cezary Manista
+
 /*
  * uchttp on Zephyr — Stage 1 example (HTTP, no TLS) with WiFi + shell.
  *

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Cezary Manista
+
 # uchttp Zephyr module build (Stage 1: HTTP, Stage 2: HTTPS/TLS, WebSocket).
 # Kept separate from the host CMakeLists.txt so the plain host/CMake build is
 # untouched. Enabled by CONFIG_UCHTTP.

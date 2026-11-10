@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cezary Manista
+
 #include "openssl_tls.h"
 
 #include <openssl/ssl.h>

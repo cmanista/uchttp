@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cezary Manista
+
 // test_uchttp_ws.cpp - gtest unit tests for the WebSocket support (req. #8)
 //
 //   - frame codec, masking, UTF-8, base64, SHA-1 (RFC test vectors)

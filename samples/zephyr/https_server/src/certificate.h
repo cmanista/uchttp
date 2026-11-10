@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cezary Manista
+
 /*
  * Auto-generated TLS credentials for the uchttp HTTPS sample (DER format).
  * Self-signed (CN=uchttp.local). DEMO ONLY — replace for production.

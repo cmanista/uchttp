@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cezary Manista
+
 // linux_ws_server.cpp - WebSocket example (requirement #8) running on a PC
 //
 //   cmake -B build && cmake --build build

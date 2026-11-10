@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cezary Manista
+
 // linux_https_server.cpp — example HTTPS server (OpenSSL backend, requirement #4)
 //
 // Build (OpenSSL backend is built automatically when OpenSSL is found):

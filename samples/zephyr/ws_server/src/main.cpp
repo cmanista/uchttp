@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cezary Manista
+
 /*
  * uchttp on Zephyr - WebSocket example (requirement #8) with WiFi + shell.
  *

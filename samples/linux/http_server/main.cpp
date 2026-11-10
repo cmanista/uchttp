@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cezary Manista
+
 // linux_server.cpp – example HTTP server running on localhost
 //
 // Build (from project root after cmake):

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cezary Manista
+
 #include "zephyr_tls.h"
 
 // Native Zephyr socket + TLS APIs (zsock_* / net_* names) mirror the plaintext
