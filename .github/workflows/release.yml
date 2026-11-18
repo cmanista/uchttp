@@ -1,0 +1,95 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Cezary Manista
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write   # required to create a GitHub Release
+
+jobs:
+  release:
+    name: Build, test and publish release
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history + tags for archiving
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build g++ libgtest-dev libgmock-dev libssl-dev
+
+      - name: Derive versions
+        id: ver
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          TAG_VERSION="${TAG#v}"
+          CMAKE_VERSION="$(sed -nE 's/.*project\(uchttp VERSION ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' CMakeLists.txt)"
+          echo "tag=$TAG"                 >> "$GITHUB_OUTPUT"
+          echo "tag_version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
+          echo "cmake_version=$CMAKE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Tag version:   $TAG_VERSION"
+          echo "CMake version: $CMAKE_VERSION"
+
+      - name: Verify tag matches CMake version
+        run: |
+          if [ "${{ steps.ver.outputs.tag_version }}" != "${{ steps.ver.outputs.cmake_version }}" ]; then
+            echo "::error::Tag v${{ steps.ver.outputs.tag_version }} does not match CMake version ${{ steps.ver.outputs.cmake_version }}"
+            exit 1
+          fi
+
+      - name: Configure
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        working-directory: build
+        run: ctest --output-on-failure
+
+      - name: Create source tarball
+        id: tar
+        run: |
+          NAME="uchttp-${{ steps.ver.outputs.tag_version }}"
+          # Archive the exact tagged tree (respects .gitignore, excludes build/).
+          git archive --format=tar.gz --prefix="${NAME}/" \
+            -o "${NAME}.tar.gz" "${GITHUB_REF_NAME}"
+          sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
+          echo "tarball=${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        run: |
+          VER="${{ steps.ver.outputs.tag_version }}"
+          # Print the body of the [VER] section (between its heading and the next '## ').
+          awk -v ver="$VER" '
+            $0 ~ "^## \\[" ver "\\]" { grab=1; next }
+            grab && /^## / { exit }
+            grab { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "Release v$VER" > RELEASE_NOTES.md
+          fi
+          echo "---- release notes ----"
+          cat RELEASE_NOTES.md
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "uchttp ${{ steps.ver.outputs.tag }}"
+          body_path: RELEASE_NOTES.md
+          draft: false
+          prerelease: ${{ startsWith(steps.ver.outputs.tag_version, '0.') }}
+          files: |
+            ${{ steps.tar.outputs.tarball }}
+            ${{ steps.tar.outputs.tarball }}.sha256

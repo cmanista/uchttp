@@ -1,6 +1,11 @@
 # uchttp — Microcontroller HTTP Server
 
-A lightweight, header-only HTTP/1.1 server for bare-metal, FreeRTOS, and Zephyr targets.
+[![CI](https://github.com/cmanista/uchttp/actions/workflows/ci.yml/badge.svg)](https://github.com/cmanista/uchttp/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/cmanista/uchttp?include_prereleases&sort=semver)](https://github.com/cmanista/uchttp/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![C++23](https://img.shields.io/badge/C%2B%2B-23-00599C.svg)](https://en.cppreference.com/w/cpp/23)
+
+A lightweight C++23 HTTP/1.1 server for bare-metal, FreeRTOS, and Zephyr targets.
 Zero heap allocations, zero-copy parsing, CRTP-based socket abstraction.
 
 ## Architecture
@@ -673,3 +678,26 @@ tests/test_uchttp_ws.cpp  106 gtest unit tests (WebSocket)
 CMakeLists.txt            Build system
 third_party/llhttp/       llhttp v9.4.3
 ```
+
+## Versioning & releases
+
+uchttp follows [Semantic Versioning](https://semver.org/). While in the `0.x`
+series the public API is considered unstable. Releases are tagged `vX.Y.Z` and
+published on the [Releases page](https://github.com/cmanista/uchttp/releases);
+see [docs/RELEASING.md](docs/RELEASING.md) for the release process and
+[CHANGELOG.md](CHANGELOG.md) for the history of changes.
+
+## License
+
+uchttp is licensed under the [MIT License](LICENSE) — Copyright (c) 2026 Cezary
+Manista. Every source file carries an `SPDX-License-Identifier: MIT` header.
+
+### Third-party
+
+| Component | Location | License |
+|---|---|---|
+| [llhttp](https://github.com/nodejs/llhttp) v9.4.3 | `third_party/llhttp/` | MIT (see `third_party/llhttp/LICENSE-MIT`) |
+
+TLS backends (OpenSSL, wolfSSL) and the Zephyr RTOS are external dependencies
+linked at build time under their own respective licenses; they are not
+distributed as part of this repository.

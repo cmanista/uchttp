@@ -13,14 +13,10 @@ add_compile_options(-Wall -Wextra -Wpedantic -Wno-unused-parameter)
 # ---------------------------------------------------------------------------
 # llhttp
 # ---------------------------------------------------------------------------
-set(LLHTTP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llhttp)
+include(${CMAKE_CURRENT_SOURCE_DIR}/third_party/llhttp.cmake)
 
-add_library(llhttp STATIC
-    ${LLHTTP_DIR}/src/api.c
-    ${LLHTTP_DIR}/src/http.c
-    ${LLHTTP_DIR}/src/llhttp.c
-)
-target_include_directories(llhttp PUBLIC ${LLHTTP_DIR}/include)
+add_library(llhttp STATIC ${LLHTTP_SOURCES})
+target_include_directories(llhttp PUBLIC ${LLHTTP_INCLUDE_DIR})
 
 # ---------------------------------------------------------------------------
 # uchttp  – static library (was header-only; now has uchttp.cpp)
@@ -37,6 +33,18 @@ target_include_directories(uchttp PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 target_link_libraries(uchttp PUBLIC llhttp)
+
+# ---------------------------------------------------------------------------
+# Generated version header (single source of truth: project(... VERSION ...))
+# ---------------------------------------------------------------------------
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/uchttp_version.h.in
+    ${CMAKE_CURRENT_BINARY_DIR}/generated/uchttp_version.h
+    @ONLY
+)
+target_include_directories(uchttp PUBLIC
+    ${CMAKE_CURRENT_BINARY_DIR}/generated
+)
 
 # ---------------------------------------------------------------------------
 # linux_socket  – static library (POSIX only, not for MCU targets)

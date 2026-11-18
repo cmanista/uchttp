@@ -8,7 +8,7 @@
 if(CONFIG_UCHTTP)
 
   set(UCHTTP_ROOT ${CMAKE_CURRENT_LIST_DIR}/..)
-  set(LLHTTP_DIR  ${UCHTTP_ROOT}/third_party/llhttp)
+  include(${UCHTTP_ROOT}/third_party/llhttp.cmake)
 
   zephyr_library()
 
@@ -42,17 +42,13 @@ if(CONFIG_UCHTTP)
   )
 
   # llhttp parser (C).
-  zephyr_library_sources(
-    ${LLHTTP_DIR}/src/api.c
-    ${LLHTTP_DIR}/src/http.c
-    ${LLHTTP_DIR}/src/llhttp.c
-  )
+  zephyr_library_sources(${LLHTTP_SOURCES})
 
   zephyr_include_directories(
     ${UCHTTP_ROOT}/include
     ${UCHTTP_ROOT}/src
     ${UCHTTP_ROOT}/src/port/zephyr
-    ${LLHTTP_DIR}/include
+    ${LLHTTP_INCLUDE_DIR}
   )
 
   # Map Kconfig options onto the library's compile-time constants. These are

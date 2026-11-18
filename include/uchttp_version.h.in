@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cezary Manista
+//
+// Generated from uchttp_version.h.in by CMake. Do not edit by hand.
+// The single source of truth for the version is project(uchttp VERSION ...)
+// in the top-level CMakeLists.txt.
+
+#pragma once
+
+#define UCHTTP_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
+#define UCHTTP_VERSION_MINOR @PROJECT_VERSION_MINOR@
+#define UCHTTP_VERSION_PATCH @PROJECT_VERSION_PATCH@
+
+#define UCHTTP_VERSION_STRING "@PROJECT_VERSION@"
+
+// Integer encoding suitable for compile-time comparisons, e.g.
+//   #if UCHTTP_VERSION >= UCHTTP_VERSION_ENCODE(0, 2, 0)
+#define UCHTTP_VERSION_ENCODE(major, minor, patch) \
+    ((major) * 10000 + (minor) * 100 + (patch))
+
+#define UCHTTP_VERSION \
+    UCHTTP_VERSION_ENCODE(UCHTTP_VERSION_MAJOR, \
+                          UCHTTP_VERSION_MINOR, \
+                          UCHTTP_VERSION_PATCH)
