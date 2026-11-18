@@ -13,21 +13,6 @@ in a minor release.
 <!-- Add changes here as they land on master. Move them under a new version
      heading when cutting a release (see docs/RELEASING.md). -->
 
-### Added
-- `MiddlewareChain::handler_called()`, true once the chain reached its final
-  target.
-
-### Changed
-
-### Fixed
-- Streaming routes (`post_stream` / `put_stream`, used for OTA upload) now run
-  the middleware chain. Before, the handler was called while the body was being
-  parsed and every middleware, including `api_key_auth` and `bearer_auth`, was
-  skipped, so an unauthenticated client could upload data. The chain now runs
-  right after the headers and before the first body chunk. A middleware that does
-  not call `next()` refuses the upload: the handler is not called and the
-  connection is closed after the middleware's reply, without reading the body.
-
 ## [0.1.0] - 2026-11-10
 
 Initial public release.
@@ -54,5 +39,23 @@ Initial public release.
 - Generated `uchttp_version.h` exposing `UCHTTP_VERSION_*` macros.
 - 215 unit tests (GTest) covering the HTTP engine and WebSocket.
 
-[Unreleased]: https://github.com/cmanista/uchttp/compare/v0.1.0...HEAD
+## [0.2.0] - 2026-11-18
+
+### Added
+- `MiddlewareChain::handler_called()`, true once the chain reached its final
+  target.
+
+### Changed
+
+### Fixed
+- Streaming routes (`post_stream` / `put_stream`, used for OTA upload) now run
+  the middleware chain. Before, the handler was called while the body was being
+  parsed and every middleware, including `api_key_auth` and `bearer_auth`, was
+  skipped, so an unauthenticated client could upload data. The chain now runs
+  right after the headers and before the first body chunk. A middleware that does
+  not call `next()` refuses the upload: the handler is not called and the
+  connection is closed after the middleware's reply, without reading the body.
+
+[Unreleased]: https://github.com/cmanista/uchttp/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/cmanista/uchttp/releases/tag/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/cmanista/uchttp/releases/tag/v0.1.0
