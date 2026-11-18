@@ -1,8 +1,8 @@
 # TLS / HTTPS
 
-Źródło: `include/uchttp_tls.h`, `include/openssl_tls.h`, `include/wolfssl_tls.h`.
-Zephyr (TLS na poziomie gniazda) opisany w [06_platform_ports.md](06_platform_ports.md).
-[← indeks](../../class_diagram.md)
+Source: `include/uchttp_tls.h`, `include/openssl_tls.h`, `include/wolfssl_tls.h`.
+TLS on Zephyr (at the socket level) is described in [06_platform_ports.md](06_platform_ports.md).
+[← index](README.md)
 
 ```mermaid
 classDiagram
@@ -110,11 +110,11 @@ classDiagram
     WolfSslSession *-- LinuxSocket : owns fd
 ```
 
-## Uwagi
+## Notes
 
-- Biblioteka kryptograficzna jest podmienialna za `TlsSessionConcept`; `TlsSocket<Session>` spełnia `SocketConcept`, więc `HttpServer<TlsSocket<...>>` działa bez zmian silnika (w tym SSE i WebSocket).
-- Handshake TLS wykonywany jest leniwie przy pierwszym `read`/`write` (lub jawnie przez `handshake()`).
-- `TlsSocket::set_read_timeout` przenosi ochronę Slowloris na połączenia TLS; `HttpConnection` używa tego także dla timeoutu WS (wykrywane przez `requires`).
-- Backend OpenSSL jest budowany zawsze, gdy OpenSSL jest dostępny; wolfSSL — gdy `UCHTTP_WITH_WOLFSSL=ON`.
-- Typy OpenSSL/wolfSSL są tylko zadeklarowane w nagłówkach (forward declaration) — `<openssl/*>` nie wycieka do publicznego API.
-- `Context` musi udostępniać `SessionType`, `RawSocketType` i `make_session(RawSocket&&)`.
+- The crypto library is replaceable behind `TlsSessionConcept`. `TlsSocket<Session>` satisfies `SocketConcept`, so `HttpServer<TlsSocket<...>>` works without any engine change (including SSE and WebSocket).
+- The TLS handshake runs lazily on the first `read` / `write`, or explicitly through `handshake()`.
+- `TlsSocket::set_read_timeout` carries Slowloris protection over to TLS connections. `HttpConnection` also uses it for the WebSocket timeout (detected with `requires`).
+- The OpenSSL backend is built whenever OpenSSL is available. The wolfSSL backend is built when `UCHTTP_WITH_WOLFSSL=ON`.
+- The OpenSSL and wolfSSL types are only forward-declared in the headers, so `<openssl/*>` does not leak into the public API.
+- A `Context` must provide `SessionType`, `RawSocketType` and `make_session(RawSocket&&)`.

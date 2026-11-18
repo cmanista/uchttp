@@ -1,7 +1,7 @@
 # Platform ports and test doubles
 
-Źródło: `src/port/linux/linux_socket.h`, `src/port/zephyr/zephyr_*.h`, `tests/mock_socket.h`.
-[← indeks](../../class_diagram.md)
+Source: `src/port/linux/linux_socket.h`, `src/port/zephyr/zephyr_*.h`, `tests/mock_socket.h`.
+[← index](README.md)
 
 ```mermaid
 classDiagram
@@ -16,10 +16,6 @@ classDiagram
         <<concept>>
         +accept() Socket
         +is_running() bool
-    }
-
-    class SocketBase~Derived~ {
-        <<CRTP base>>
     }
 
     %% ---- Linux ----
@@ -106,6 +102,7 @@ classDiagram
         +used() size_t
         -slab_ : k_mem_slab
         -buf_ : uint8_t[]
+        -inited_ : bool
     }
 
     class Sha1Concept {
@@ -151,7 +148,6 @@ classDiagram
     AcceptorConcept <|.. ZephyrAcceptor
     AcceptorConcept <|.. ZephyrTlsAcceptor
     AcceptorConcept <|.. MockAcceptor
-    SocketBase <|-- LinuxSocket : optional CRTP
 
     LinuxAcceptor ..> LinuxSocket : produces
     ZephyrAcceptor ..> ZephyrSocket : produces
@@ -163,11 +159,11 @@ classDiagram
     AllocatorConcept <|.. ZephyrSlabAllocator
 ```
 
-## Uwagi
+## Notes
 
-- **Linux** (`LinuxSocket`, `LinuxAcceptor`): POSIX `recv`/`send`, `SO_RCVTIMEO` jako idle timeout (`UCHTTP_IDLE_TIMEOUT_MS`). Służy do testów na hoście; jest też transportem backendów OpenSSL/wolfSSL (zob. [05_tls.md](05_tls.md)).
-- **Zephyr** (`ZephyrSocket`, `ZephyrAcceptor`): natywne API `zsock_*`/`net_*`. Rdzeń (`uchttp.h`) jest niezmieniony — różni się tylko port.
-- **Zephyr TLS**: TLS (Mbed TLS / PSA Crypto) działa transparentnie na poziomie gniazda (`IPPROTO_TLS_1_2` + `sec_tag`), więc nie ma osobnej sesji — `ZephyrTlsAcceptor` zwraca zwykły `ZephyrSocket`. `ZephyrTlsCredentials` rejestruje certyfikat/klucz, CA lub PSK; bufory należy trzymać przy życiu (store nie kopiuje).
-- **Zephyr WS**: `ZephyrPsaSha1` (PSA Crypto, akceleracja sprzętowa tam gdzie sterownik PSA wspiera SHA-1) i `ZephyrSlabAllocator` (`k_mem_slab`) podłączane przez `ws::Traits`.
-- **Porting na inny RTOS**: wystarczy własny `Socket` (`read`, `write`, `close`, `is_valid`, opcjonalnie `set_read_timeout`) i `Acceptor` (`accept`, `is_running`).
-- **Testy**: `MockSocket`/`MockAcceptor` (`namespace uchttp_test`) to bufory w pamięci; `MockAcceptor` obsługuje dokładnie jedno połączenie.
+- **Linux** (`LinuxSocket`, `LinuxAcceptor`): POSIX `recv` / `send`, with `SO_RCVTIMEO` as the idle timeout (`UCHTTP_IDLE_TIMEOUT_MS`). Used for tests on a host. It is also the transport of the OpenSSL and wolfSSL backends (see [05_tls.md](05_tls.md)).
+- **Zephyr** (`ZephyrSocket`, `ZephyrAcceptor`): the native `zsock_*` / `net_*` API. The core (`uchttp.h`) is unchanged, only the port differs.
+- **Zephyr TLS**: TLS (Mbed TLS / PSA Crypto) works transparently at the socket level (`IPPROTO_TLS_1_2` + `sec_tag`), so there is no separate session type. `ZephyrTlsAcceptor` returns a plain `ZephyrSocket`. `ZephyrTlsCredentials` registers the certificate and key, a CA, or a PSK. Keep the buffers alive, because the credential store does not copy them.
+- **Zephyr WebSocket**: `ZephyrPsaSha1` (PSA Crypto, hardware acceleration where the PSA driver supports SHA-1) and `ZephyrSlabAllocator` (`k_mem_slab`) are plugged in through `ws::Traits`.
+- **Porting to another RTOS**: you need your own `Socket` (`read`, `write`, `close`, `is_valid`, optionally `set_read_timeout`) and `Acceptor` (`accept`, `is_running`).
+- **Tests**: `MockSocket` / `MockAcceptor` (`namespace uchttp_test`) are in-memory buffers. `MockAcceptor` serves exactly one connection.

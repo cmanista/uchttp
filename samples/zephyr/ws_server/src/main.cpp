@@ -18,7 +18,7 @@
  * that accept on one listening socket: that many simultaneous clients.
  *
  * WiFi: set CONFIG_APP_WIFI_SSID / CONFIG_APP_WIFI_PSK (e.g. in a local
- * `local.conf`, see the README) to join automatically, or leave them empty
+ * `local.conf`, see docs/usage/zephyr.md) to join automatically, or leave them empty
  * and connect from the console:
  *
  *   uart:~$ wifi connect -s <SSID> -k 1 -p <PASSWORD>

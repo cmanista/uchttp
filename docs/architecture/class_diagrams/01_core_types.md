@@ -1,6 +1,6 @@
 # Core types
 
-Źródło: `include/uchttp.h`, `src/uchttp.cpp`. [← indeks](../../class_diagram.md)
+Source: `include/uchttp.h`, `src/uchttp.cpp`. [← index](README.md)
 
 ```mermaid
 classDiagram
@@ -18,10 +18,17 @@ classDiagram
     }
 
     class SocketBase~Derived~ {
-        <<CRTP base>>
+        <<CRTP base, optional>>
         +read(span~uint8_t~) int
         +write(span~const uint8_t~) int
         +close() void
+        #SocketBase()
+    }
+
+    class MethodHelpers {
+        <<free functions>>
+        +llhttp_method_to_uchttp(uint8_t) HttpMethod
+        +method_string(HttpMethod) const char*
     }
 
     class HttpMethod {
@@ -49,6 +56,7 @@ classDiagram
     }
 
     class QueryString {
+        +QueryString()
         +QueryString(raw : string_view)
         +begin() iterator
         +end() iterator
@@ -59,7 +67,7 @@ classDiagram
         -raw_ : string_view
     }
 
-    class QueryPair {
+    class QueryPair["QueryString::Pair"] {
         <<struct>>
         +key : string_view
         +value : string_view
@@ -160,6 +168,7 @@ classDiagram
     HttpRequest *-- HttpHeader : 0..N
     HttpRequest *-- PathParam : 0..N
     HttpRequest --> HttpMethod
+    MethodHelpers ..> HttpMethod
     HttpRequest ..> QueryString : creates (lazy)
     QueryString ..> QueryPair : iterates
     HttpResponse *-- HttpHeader : 0..N
@@ -171,11 +180,13 @@ classDiagram
     Route o-- WsHandlers : WebSocket endpoint
 ```
 
-## Uwagi
+## Notes
 
-- `HttpRequest` zawiera wyłącznie `string_view` wskazujące w bufor RX (zero-copy). Metadane protokołu (`keep_alive`, `chunked`, `content_length`, `http_major/minor`) wypełnia parser w `on_headers_complete`.
-- `HttpResponse` tylko trzyma widoki (`add_header` nie kopiuje) — wartości generowane w czasie działania trafiają do `scratch()`.
-- `Route` ma trzy rodzaje: zwykły (`handler`), strumieniowy/OTA (`stream`) lub WebSocket (`ws`); dokładnie jedno pole jest niepuste.
-- Handler strumieniowy (`StreamHandlerFn`) dostaje kolejne kawałki body jako widoki w bufor RX; `last == true` przy ostatnim.
-- `write_raw` / `begin_sse` / `send_event` "przejmują" odpowiedź (`hijacked()`), więc silnik nie wysyła już własnej, buforowanej.
-- `SocketBase<Derived>` to opcjonalny helper CRTP; `SocketConcept` jest spełniany także bez niego.
+- `HttpRequest` holds only `string_view`s that point into the RX buffer (zero-copy). The parser fills the protocol metadata (`keep_alive`, `chunked`, `content_length`, `http_major/minor`) in `on_headers_complete`.
+- `HttpResponse` only holds views (`add_header` does not copy). Values generated at run time go into `scratch()`.
+- A `Route` is one of three kinds: normal (`handler`), streaming/OTA (`stream`) or WebSocket (`ws`). Exactly one of these fields is non-null.
+- A streaming handler (`StreamHandlerFn`) receives the body in consecutive chunks as views into the RX buffer. `last == true` marks the final call.
+- `write_raw` / `begin_sse` / `send_event` "hijack" the response (`hijacked()`), so the engine does not send its own buffered reply.
+- `SocketBase<Derived>` is an optional CRTP helper (its methods forward to `read_impl` / `write_impl` / `close_impl` of the derived class). None of the bundled ports uses it. `SocketConcept` is satisfied directly.
+- `QueryString::Pair` is a nested type (`key`, `value`). The iterator is forward-only and does not allocate.
+- `UCHTTP_MAX_HEADERS` (default 16) and `UCHTTP_MAX_PATH_PARAMS` (default 8) set the array sizes in `HttpRequest` / `HttpResponse`. The full list of configuration macros is in [../README.md](../README.md#compile-time-configuration).

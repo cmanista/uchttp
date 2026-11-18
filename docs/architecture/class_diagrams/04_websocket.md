@@ -1,8 +1,8 @@
 # WebSocket (RFC 6455)
 
-Źródło: `include/uchttp_ws.h`, `include/uchttp.h` (handshake),
+Source: `include/uchttp_ws.h`, `include/uchttp.h` (handshake),
 `src/uchttp_ws*.cpp`, `src/port/zephyr/zephyr_ws.h`, `src/port/zephyr/zephyr_psa_sha1.h`.
-[← indeks](../../class_diagram.md)
+[← index](README.md)
 
 ```mermaid
 classDiagram
@@ -110,6 +110,21 @@ classDiagram
         +ctx : void*
     }
 
+    class CloseCode {
+        <<namespace uchttp::ws::close_code>>
+        normal = 1000
+        going_away = 1001
+        protocol_error = 1002
+        unsupported = 1003
+        no_status = 1005
+        abnormal = 1006
+        invalid_payload = 1007
+        policy = 1008
+        too_big = 1009
+        extension = 1010
+        internal_error = 1011
+    }
+
     class Session {
         +send_text(text) bool
         +send_binary(data) bool
@@ -123,12 +138,25 @@ classDiagram
         -h_ : const Handlers&
         -rx_ : span~uint8_t~
         -tx_ : span~uint8_t~
+        -user_ : void*
+        -msg_cap_ : size_t
+        -max_frame_ : size_t
         -state_ : State
+        -broken_ : bool
+        -Session(t, h, rx, tx)
         -run(req, leftover) void
         -send_frame(op, p, n) bool
+        -write_all(p, n) bool
         -fail(code) void
         -drain() void
         -finish(code) void
+    }
+
+    class SessionState {
+        <<enumeration>>
+        open
+        closing
+        closed
     }
 
     class Handshake {
@@ -137,6 +165,10 @@ classDiagram
         +header_has_token(list, token, ignore_case) bool
         +validate_handshake(req, key) int
         +upgrade_handler~Sha1~(req, res) void
+    }
+
+    class Serve {
+        <<free function, friend of Session>>
         +serve(t, h, req, rx, tx, leftover) void
     }
 
@@ -155,6 +187,7 @@ classDiagram
         +used() size_t
         -slab_ : k_mem_slab
         -buf_ : uint8_t[]
+        -inited_ : bool
     }
 
     class HttpConnection {
@@ -182,19 +215,24 @@ classDiagram
     Session ..> Codec : frames
     Session o-- Handlers
     Session o-- Transport
+    Session *-- SessionState
     Session ..> Opcode
-    Handshake ..> Session : creates
+    Session ..> CloseCode
+    Serve ..> Session : creates (friend)
     Handshake ..> Codec : compute_accept
-    HttpConnection ..> Handshake : upgrade + serve
+    HttpConnection ..> Handshake : upgrade_handler
+    HttpConnection ..> Serve : serve()
     HttpConnection ..> Transport : binds to Socket
     HttpConnection ..> AllocatorConcept : session buffer
 ```
 
-## Uwagi
+## Notes
 
-- Rdzeń WebSocket (`uchttp_ws.h`) nie zna gniazd, OS ani biblioteki kryptograficznej; wszystko jest wstrzykiwane: SHA-1 (`Sha1Concept`), pamięć sesji (`AllocatorConcept`), transport (`Transport` — wskaźniki na funkcje + kontekst, wiązany przez `HttpConnection`).
-- Endpoint WS to zwykła trasa (`HttpServer::websocket`). `HttpConnection` po odpowiedzi `101` pobiera bufor z alokatora (brak pamięci → `503`), wywołuje opcjonalne `Handlers::accept` (odmowa → `403`) i uruchamia `ws::serve`.
-- `Session` ma prywatny konstruktor; tworzy go wyłącznie `ws::serve` (friend).
-- Limity: `UCHTTP_WS_MAX_FRAME_SIZE` (sprawdzany z samego nagłówka), `UCHTTP_WS_MAX_MESSAGE_SIZE` (po złożeniu fragmentów, close `1009`), keep-alive Ping po `UCHTTP_WS_PING_INTERVAL_MS`.
-- `on_idle` jest wołane przy każdym wygaśnięciu timeoutu odczytu (`idle_interval_ms`) — okresowy push bez dodatkowego wątku.
-- Komponenty Zephyra (`ZephyrPsaSha1`, `ZephyrSlabAllocator`) opisane także w [06_platform_ports.md](06_platform_ports.md).
+- The WebSocket core (`uchttp_ws.h`) knows nothing about sockets, the OS or a crypto library. Everything is injected: SHA-1 (`Sha1Concept`), session memory (`AllocatorConcept`) and the transport (`Transport`: function pointers plus a context, bound by `HttpConnection`).
+- A WebSocket endpoint is an ordinary route (`HttpServer::websocket`). After the `101` reply, `HttpConnection` takes a buffer from the allocator (no memory means `503`), calls the optional `Handlers::accept` (refusal means `403`) and runs `ws::serve`.
+- `Session` has a private constructor. Only `ws::serve` (a friend) creates it.
+- Transport: `ReadFn` returns `>0` bytes, `0` when the peer closed, `<0` on timeout or error. `set_timeout` is optional (set only when the `Socket` has `set_read_timeout`).
+- `UCHTTP_WS_CONTROL_RESERVE` (144 B) keeps room in the session buffer for a control frame between the fragments of a message. `UCHTTP_WS_BUFFER_SIZE` = `UCHTTP_WS_MAX_MESSAGE_SIZE` + that reserve.
+- Limits: `UCHTTP_WS_MAX_FRAME_SIZE` (checked from the frame header alone) and `UCHTTP_WS_MAX_MESSAGE_SIZE` (after reassembly, close code `1009`). A keep-alive Ping is sent after `UCHTTP_WS_PING_INTERVAL_MS`.
+- `on_idle` is called every time the read timeout expires (`idle_interval_ms`), which gives periodic push without an extra thread.
+- The Zephyr components (`ZephyrPsaSha1`, `ZephyrSlabAllocator`) are also described in [06_platform_ports.md](06_platform_ports.md).
