@@ -7,9 +7,6 @@
 
 ## Architecture
 
-How the server is built: layers, request lifecycle, memory and concurrency model,
-compile-time configuration, source layout.
-
 - [Architecture overview](architecture/README.md)
 - [Class diagrams](architecture/class_diagrams/README.md) (core types, engine,
   middleware, WebSocket, TLS, platform ports)

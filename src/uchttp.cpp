@@ -315,8 +315,9 @@ void ParseState::reset() noexcept {
     body_too_large    = false;
     stream_handler    = nullptr;
     stream_offset     = 0;
-    // stream_resolve/stream_ctx/stream_response are bound per-connection and
-    // preserved across keep-alive requests.
+    stream_rejected   = false;
+    // stream_resolve/stream_gate/stream_ctx/stream_response are bound
+    // per-connection and preserved across keep-alive requests.
 }
 
 void ParseState::commit_header() noexcept {
@@ -414,6 +415,17 @@ static int cb_on_headers_complete(llhttp_t* p) noexcept {
     // engine can push body chunks to a streaming handler instead of buffering.
     if (s->stream_resolve) {
         s->stream_handler = s->stream_resolve(s->stream_ctx, s->request);
+
+        // The streaming handler is driven from the parser, so the middleware
+        // chain (auth, ...) has to run here, before the first body chunk. If a
+        // middleware refuses, stop parsing: no byte of the body reaches the
+        // handler and the engine replies with the middleware's response.
+        if (s->stream_handler && s->stream_gate && s->stream_response &&
+            !s->stream_gate(s->stream_ctx, s->request, *s->stream_response)) {
+            s->stream_handler  = nullptr;
+            s->stream_rejected = true;
+            return HPE_USER;
+        }
     }
     return HPE_OK;
 }

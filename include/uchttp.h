@@ -475,6 +475,11 @@ public:
     // Kick off the chain from the beginning.
     void run(const HttpRequest& req, HttpResponse& res) noexcept;
 
+    // True once the chain has reached its final target. It stays false when a
+    // middleware ended the chain early by not calling next(). The engine uses
+    // this to tell whether a streaming upload was accepted by the middleware.
+    bool handler_called() const noexcept { return handler_called_; }
+
 private:
     const MiddlewareFn* mws_   { nullptr };
     size_t              count_ { 0 };
@@ -648,6 +653,19 @@ struct ParseState {
     HttpResponse*   stream_response { nullptr };  // response bound for streaming
     size_t          stream_offset  { 0 };
 
+    // Middleware gate for streaming routes. The streaming handler runs while the
+    // body is still being parsed, before the engine dispatches the request, so
+    // the middleware chain has to run right after the headers are complete and
+    // before the first chunk. The engine binds a type-erased gate (it knows the
+    // middleware array); it returns true when the chain reached the end, i.e.
+    // no middleware refused the request. On refusal the parser is stopped,
+    // `stream_rejected` is set and the engine answers with the response the
+    // middleware produced.
+    using StreamGateFn = bool (*)(void* ctx, const HttpRequest& req,
+                                  HttpResponse& res) noexcept;
+    StreamGateFn    stream_gate     { nullptr };
+    bool            stream_rejected { false };
+
     void reset() noexcept;
     void commit_header() noexcept;
 };
@@ -762,8 +780,12 @@ public:
         // Wire the streaming-body resolver (requirement #7). The resolver is a
         // static trampoline templated on MaxRoutes, so the non-template parser
         // callbacks can look up a route without knowing the table's capacity.
-        state_.stream_resolve = &stream_resolve_trampoline<MaxRoutes>;
-        state_.stream_ctx     = const_cast<RouteTable<MaxRoutes>*>(&routes);
+        // The context also carries the middleware array: the gate trampoline
+        // runs the chain before the first body chunk reaches the handler.
+        StreamCtx<MaxRoutes> stream_ctx { &routes, middleware, middleware_count };
+        state_.stream_resolve  = &stream_resolve_trampoline<MaxRoutes>;
+        state_.stream_gate     = &stream_gate_trampoline<MaxRoutes>;
+        state_.stream_ctx      = &stream_ctx;
         state_.stream_response = &response_;
 
         bool   handled_any = false;
@@ -834,6 +856,16 @@ public:
                 buffered += static_cast<size_t>(n);
             }
 
+            if (state_.stream_rejected) {
+                // Streaming route refused by the middleware chain (requirement
+                // #7 + #5): the parser was stopped before any body byte reached
+                // the handler. Answer with what the middleware produced and
+                // close, so the rest of the upload is not read.
+                handled_any = true;
+                response_.set_keep_alive(false);
+                if (!response_.hijacked()) (void)response_.send(socket_);
+                return handled_any;
+            }
             if (state_.headers_too_large) {
                 // DoS protection (requirement #4): header block too large.
                 send_error(431, "Request Header Fields Too Large", false);
@@ -1008,15 +1040,42 @@ private:
         alloc->deallocate(mem, UCHTTP_WS_BUFFER_SIZE);
     }
 
+    // Context handed to the type-erased streaming trampolines below: the route
+    // table (to resolve the route) and the middleware array (for the gate).
+    // Lives on the stack of process() for the duration of the call.
+    template <size_t MaxRoutes>
+    struct StreamCtx {
+        const RouteTable<MaxRoutes>* routes;
+        const MiddlewareFn*          middleware;
+        size_t                       middleware_count;
+    };
+
     // Type-erased streaming-route resolver (requirement #7). Templated on the
     // route-table capacity so the non-template parser callbacks can look up a
     // route; returns the matched route's streaming handler, or nullptr.
     template <size_t MaxRoutes>
     static StreamHandlerFn stream_resolve_trampoline(void* ctx,
                                                      HttpRequest& req) noexcept {
-        auto* routes = static_cast<const RouteTable<MaxRoutes>*>(ctx);
-        const Route* r = routes->find(req.method, req.path, req);
+        auto* c = static_cast<const StreamCtx<MaxRoutes>*>(ctx);
+        const Route* r = c->routes->find(req.method, req.path, req);
         return (r && r->stream) ? r->stream : nullptr;
+    }
+
+    // Final target of the chain for a streaming route: nothing to do here, the
+    // streaming handler is driven by the parser. Reaching it means that every
+    // middleware called next().
+    static void stream_gate_pass(const HttpRequest&, HttpResponse&) noexcept {}
+
+    // Runs the middleware chain for a streaming route and reports whether the
+    // request was accepted (the chain reached the end).
+    template <size_t MaxRoutes>
+    static bool stream_gate_trampoline(void* ctx, const HttpRequest& req,
+                                       HttpResponse& res) noexcept {
+        auto* c = static_cast<const StreamCtx<MaxRoutes>*>(ctx);
+        MiddlewareChain chain(c->middleware, c->middleware_count,
+                              &stream_gate_pass);
+        chain.run(req, res);
+        return chain.handler_called();
     }
 };
 
@@ -1148,6 +1207,9 @@ public:
 
     // Streaming body routes (requirement #7, OTA). The handler receives body
     // chunks as they arrive without the engine buffering the full payload.
+    // Middleware registered with use() runs first, right after the headers and
+    // before the first chunk; if one of them does not call next() the handler
+    // is never called and the connection is closed after that middleware's reply.
     bool post_stream(std::string_view path, StreamHandlerFn h) noexcept {
         return routes_.add_stream(HttpMethod::POST, path, h);
     }

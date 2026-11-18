@@ -47,11 +47,15 @@ full.
 |---|---|
 | Normal route | Yes |
 | WebSocket upgrade | Yes. A middleware can reject the upgrade (for example `401`). |
-| Streaming route (`post_stream`, `put_stream`) | **No.** Authenticate inside the handler. |
+| Streaming route (`post_stream`, `put_stream`) | Yes, once, right after the headers and before the first body chunk. A middleware that does not call `next()` refuses the upload: the handler is not called and the connection is closed after the middleware's reply. |
 | `404`, `405`, `501` and protocol errors (`400`, `413`, `431`) | No. They are produced by the engine. |
 
 Because of the last row, headers added by middleware such as `security_headers`
 are not present on `404` / `405` replies.
+
+For streaming routes, code after `chain.next()` runs before the body is streamed,
+so a middleware that reads the response body (such as `etag`) sees it empty. See
+[Streaming body / OTA](iot.md#streaming-body--ota-firmware-upload).
 
 ## Bundled application middleware
 

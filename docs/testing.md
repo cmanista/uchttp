@@ -30,7 +30,7 @@ CMake uses an installed GTest (`find_package(GTest)`). If none is found it
 downloads googletest v1.14.0 with `FetchContent`, which needs network access
 during configure.
 
-Current state: 215 tests in 24 suites (109 in `tests/test_uchttp.cpp`, 106 in
+Current state: 222 tests in 24 suites (116 in `tests/test_uchttp.cpp`, 106 in
 `tests/test_uchttp_ws.cpp`), all passing.
 
 ### Troubleshooting
@@ -75,7 +75,7 @@ cmake --build build
 | `MiddlewareChainTest`, `MiddlewareTest` | 1 + 7 | Order, short-circuit, response-header injection, empty and null slots |
 | `AppMiddlewareTest` | 7 | `Cache-Control`, `ETag` / `304`, `X-Request-ID`, `Accept-Encoding` |
 | `SecurityTest` | 14 | `secure_compare`, API key and bearer auth (including fail-closed), security headers, `431` and `413` |
-| `EdgeStreamTest` | 3 | Streaming body with `Content-Length` and chunked, no body cap |
+| `EdgeStreamTest` | 10 | Streaming body with `Content-Length` and chunked, no body cap, middleware gate for streaming routes (pass, refusal, `api_key_auth`, keep-alive) |
 | `EdgeSseTest` | 4 | SSE headers, event framing, multi-line data, response hijack |
 | `ConnectionPoolTest` | 4 | Acquire / release, exhaustion, `close_all`, serving through a slot |
 | `HttpServerTest` | 6 | Run loop via `MockAcceptor`, method helpers, `use()` capacity, pool introspection |

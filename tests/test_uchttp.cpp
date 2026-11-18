@@ -2073,6 +2073,203 @@ TEST(EdgeStreamTest, StreamingBodyNotCappedByBodyLimit) {
     EXPECT_NE(parse_status_code(tx), 413);
 }
 
+// --- Streaming routes and the middleware chain -----------------------------
+//
+// The chain runs once per request, after the headers are parsed and before the
+// first body chunk reaches the streaming handler. A middleware that does not
+// reach the end of the chain refuses the upload: the handler is never called
+// and the engine answers with what the middleware produced.
+
+namespace {
+    int g_mw_runs = 0;
+
+    void mw_count_and_tag(const HttpRequest& req, HttpResponse& res,
+                          MiddlewareChain& chain) {
+        ++g_mw_runs;
+        chain.next(req, res);
+        res.add_header("X-Tagged", "yes");      // runs on the way back out
+    }
+
+    void mw_deny(const HttpRequest&, HttpResponse& res, MiddlewareChain&) {
+        ++g_mw_runs;
+        res.set_status(401);
+        res.set_content_type("text/plain");
+        res.set_body("denied");
+    }
+
+    void mw_answer_200_itself(const HttpRequest&, HttpResponse& res,
+                              MiddlewareChain&) {
+        ++g_mw_runs;
+        res.set_status(200);
+        res.set_body("handled by middleware");
+    }
+
+    std::string ota_post(size_t payload_size, const char* extra_headers = "") {
+        std::string payload(payload_size, 'F');
+        return "POST /ota HTTP/1.1\r\nHost: x\r\n" + std::string(extra_headers) +
+               "Content-Length: " + std::to_string(payload.size()) + "\r\n"
+               "Connection: close\r\n\r\n" + payload;
+    }
+}
+
+TEST(EdgeStreamTest, MiddlewareRunsBeforeStreamingHandler) {
+    g_ota = {}; g_mw_runs = 0;
+    RouteTable<8> rt;
+    rt.add_stream(HttpMethod::POST, "/ota", ota_sink);
+    const MiddlewareFn mws[] = { mw_count_and_tag };
+
+    std::string tx;
+    RefMockSocket sock(ota_post(3000), tx);
+    HttpConnection<RefMockSocket, 8192> conn(std::move(sock));
+    conn.process(rt, mws, 1);
+
+    EXPECT_EQ(g_mw_runs, 1);
+    EXPECT_EQ(g_ota.received.size(), 3000u);
+    EXPECT_TRUE(g_ota.got_last);
+    EXPECT_EQ(parse_status_code(tx), 201);
+    // Code placed after chain.next() has run, so its header is in the reply.
+    EXPECT_FALSE(header_value(tx, "X-Tagged").empty());
+}
+
+TEST(EdgeStreamTest, MiddlewareRefusalSkipsStreamingHandler) {
+    g_ota = {}; g_mw_runs = 0;
+    RouteTable<8> rt;
+    rt.add_stream(HttpMethod::POST, "/ota", ota_sink);
+    const MiddlewareFn mws[] = { mw_deny };
+
+    std::string tx;
+    RefMockSocket sock(ota_post(3000), tx);
+    HttpConnection<RefMockSocket, 8192> conn(std::move(sock));
+    conn.process(rt, mws, 1);
+
+    EXPECT_EQ(g_mw_runs, 1);
+    EXPECT_EQ(g_ota.chunks, 0u);              // no byte reached the handler
+    EXPECT_FALSE(g_ota.got_last);             // not even the final call
+    EXPECT_EQ(parse_status_code(tx), 401);
+    EXPECT_EQ(count_responses(tx), 1);
+    EXPECT_EQ(header_value(tx, "Connection"), "close");
+    EXPECT_TRUE(tx.ends_with("denied"));
+}
+
+TEST(EdgeStreamTest, RefusalWorksWithChunkedBodyAndEmptyBody) {
+    g_ota = {}; g_mw_runs = 0;
+    RouteTable<8> rt;
+    rt.add_stream(HttpMethod::POST, "/ota", ota_sink);
+    const MiddlewareFn mws[] = { mw_deny };
+
+    {   // chunked upload
+        std::string tx;
+        RefMockSocket sock(
+            "POST /ota HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
+            "Connection: close\r\n\r\n4\r\nWiki\r\n0\r\n\r\n", tx);
+        HttpConnection<RefMockSocket> conn(std::move(sock));
+        conn.process(rt, mws, 1);
+        EXPECT_EQ(parse_status_code(tx), 401);
+    }
+    {   // no body at all: the final last=true call must not happen either
+        std::string tx;
+        RefMockSocket sock(ota_post(0), tx);
+        HttpConnection<RefMockSocket> conn(std::move(sock));
+        conn.process(rt, mws, 1);
+        EXPECT_EQ(parse_status_code(tx), 401);
+    }
+    EXPECT_EQ(g_ota.chunks, 0u);
+    EXPECT_FALSE(g_ota.got_last);
+}
+
+TEST(EdgeStreamTest, MiddlewareThatAnswersItselfIsNotAnAcceptance) {
+    // Not calling next() means the chain never reached the handler, even when
+    // the middleware's own status is 200 (for example a CORS preflight).
+    g_ota = {}; g_mw_runs = 0;
+    RouteTable<8> rt;
+    rt.add_stream(HttpMethod::POST, "/ota", ota_sink);
+    const MiddlewareFn mws[] = { mw_answer_200_itself };
+
+    std::string tx;
+    RefMockSocket sock(ota_post(100), tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt, mws, 1);
+
+    EXPECT_EQ(g_ota.chunks, 0u);
+    EXPECT_FALSE(g_ota.got_last);
+    EXPECT_EQ(parse_status_code(tx), 200);
+    EXPECT_TRUE(tx.ends_with("handled by middleware"));
+}
+
+TEST(EdgeStreamTest, ApiKeyAuthProtectsStreamingRoute) {
+    g_ota = {};
+    security::set_api_key("s3cr3t");
+    RouteTable<8> rt;
+    rt.add_stream(HttpMethod::POST, "/ota", ota_sink);
+    const MiddlewareFn mws[] = { security::api_key_auth };
+
+    {   // no key
+        std::string tx;
+        RefMockSocket sock(ota_post(500), tx);
+        HttpConnection<RefMockSocket> conn(std::move(sock));
+        conn.process(rt, mws, 1);
+        EXPECT_EQ(parse_status_code(tx), 401);
+        EXPECT_EQ(g_ota.chunks, 0u);
+    }
+    {   // wrong key
+        std::string tx;
+        RefMockSocket sock(ota_post(500, "X-API-Key: nope\r\n"), tx);
+        HttpConnection<RefMockSocket> conn(std::move(sock));
+        conn.process(rt, mws, 1);
+        EXPECT_EQ(parse_status_code(tx), 401);
+        EXPECT_EQ(g_ota.chunks, 0u);
+    }
+    {   // right key
+        std::string tx;
+        RefMockSocket sock(ota_post(500, "X-API-Key: s3cr3t\r\n"), tx);
+        HttpConnection<RefMockSocket> conn(std::move(sock));
+        conn.process(rt, mws, 1);
+        EXPECT_EQ(parse_status_code(tx), 201);
+        EXPECT_EQ(g_ota.received.size(), 500u);
+        EXPECT_TRUE(g_ota.got_last);
+    }
+    security::set_api_key({});
+}
+
+TEST(EdgeStreamTest, MiddlewareRunsOncePerRequestOnKeepAlive) {
+    g_ota = {}; g_mw_runs = 0;
+    RouteTable<8> rt;
+    rt.add_stream(HttpMethod::POST, "/ota", ota_sink);
+    const MiddlewareFn mws[] = { mw_count_and_tag };
+
+    const std::string one =
+        "POST /ota HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\nABCD";
+    const std::string two =
+        "POST /ota HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n"
+        "Connection: close\r\n\r\nXYZ";
+    std::string tx;
+    RefMockSocket sock(one + two, tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt, mws, 1);
+
+    EXPECT_EQ(g_mw_runs, 2);
+    EXPECT_EQ(g_ota.received, "ABCDXYZ");
+    EXPECT_EQ(count_responses(tx), 2);
+}
+
+TEST(EdgeStreamTest, NormalRoutesStillUseTheChainOnlyOnce) {
+    g_mw_runs = 0;
+    RouteTable<8> rt;
+    rt.add(HttpMethod::GET, "/x", [](const HttpRequest&, HttpResponse& res) {
+        res.set_status(200);
+    });
+    rt.add_stream(HttpMethod::POST, "/ota", ota_sink);
+    const MiddlewareFn mws[] = { mw_count_and_tag };
+
+    std::string tx;
+    RefMockSocket sock("GET /x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", tx);
+    HttpConnection<RefMockSocket> conn(std::move(sock));
+    conn.process(rt, mws, 1);
+
+    EXPECT_EQ(g_mw_runs, 1);
+    EXPECT_EQ(parse_status_code(tx), 200);
+}
+
 TEST(HttpServerTest, StreamRouteHelpers) {
     HttpServer<MockSocket> server;
     EXPECT_TRUE(server.post_stream("/ota", ota_sink));

@@ -14,10 +14,19 @@ in a minor release.
      heading when cutting a release (see docs/RELEASING.md). -->
 
 ### Added
+- `MiddlewareChain::handler_called()`, true once the chain reached its final
+  target.
 
 ### Changed
 
 ### Fixed
+- Streaming routes (`post_stream` / `put_stream`, used for OTA upload) now run
+  the middleware chain. Before, the handler was called while the body was being
+  parsed and every middleware, including `api_key_auth` and `bearer_auth`, was
+  skipped, so an unauthenticated client could upload data. The chain now runs
+  right after the headers and before the first body chunk. A middleware that does
+  not call `next()` refuses the upload: the handler is not called and the
+  connection is closed after the middleware's reply, without reading the body.
 
 ## [0.1.0] - 2026-11-10
 

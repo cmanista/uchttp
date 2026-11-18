@@ -27,22 +27,35 @@ server.post_stream("/api/ota", ota);            // also put_stream(...)
   routes.
 - If the handler does not take over the response, the engine sends `200 OK`.
 
-**Streaming routes bypass the middleware chain.** The handler runs while the body
-is still being parsed, before dispatch, so `api_key_auth`, `bearer_auth` and
-other middleware do not protect it. Authenticate inside the handler. The request
-headers are already available in `req` for every chunk, including the first:
+### Authentication and middleware
+
+Streaming routes go through the middleware chain like any other route. The engine
+runs the chain as soon as the request headers are complete, before the first
+chunk, so global middleware protect an upload:
 
 ```cpp
-void ota(const HttpRequest& req, HttpResponse& res,
-         std::span<const uint8_t> chunk, size_t offset, bool last) {
-    if (!uchttp::security::secure_compare(req.get_header("X-API-Key"), "s3cr3t")) {
-        res.set_status(401);
-        return;                                  // do not write to flash
-    }
-    flash_write(partition, offset, chunk);
-    if (last) { res.set_status(201); res.set_body("flashed"); }
-}
+uchttp::security::set_api_key("s3cr3t");
+server.use(uchttp::security::api_key_auth);     // also guards /api/ota
+server.post_stream("/api/ota", ota);
 ```
+
+- If every middleware calls `next()`, the handler receives the chunks as above.
+- If a middleware does not call `next()` (for example `api_key_auth` answering
+  `401`), the handler is never called, not even with `last == true`. The engine
+  stops reading, sends the middleware's response and closes the connection, so a
+  rejected client cannot make the device read the rest of a large upload.
+  A middleware that answers a request itself with `200` counts as a refusal too:
+  the handler runs only when the chain reaches its end.
+- Code a middleware runs after `chain.next()` executes right after the headers,
+  before the body is streamed. Headers it adds (for example from
+  `security_headers`) are part of the final response. A middleware that inspects
+  the response body (such as `etag`) sees it empty at that point, because the
+  streaming handler has not produced it yet.
+- The chain runs once per request, also on keep-alive connections.
+
+The handler can still refuse an upload for its own reasons (for example an
+invalid image header), but it is called for every chunk, so it must remember its
+decision (a flag in its own state) and skip writing the remaining chunks.
 
 ## Server-Sent Events (SSE)
 

@@ -77,9 +77,6 @@ Design rules the code follows:
   WebSocket sessions are fixed-size arrays sized at compile time.
 - **Zero-copy.** `HttpRequest` holds `string_view`s into the RX buffer. They stay
   valid until the next request is read on the same connection.
-- **Implementation in `.cpp`, templates in headers.** Only code that must be a
-  template (engine, pool, TLS adapter) lives in `uchttp.h`. The rest is in
-  `src/`.
 - **Parser.** [llhttp](https://github.com/nodejs/llhttp) v9.4.3 is vendored in
   `third_party/` (see
   [UPSTREAM.md](../../third_party/llhttp/UPSTREAM.md) for its origin).
@@ -152,7 +149,9 @@ Decision order inside `HttpConnection::process` once a request has been read.
 
 ```mermaid
 flowchart TD
-    start(["request read"]) --> e431{"header block<br/>too large?"}
+    start(["request read"]) --> rej{"streaming route refused<br/>by the middleware?"}
+    rej -- yes --> rrej["middleware's own response, for example 401<br/>upload body is not read<br/>close"]
+    rej -- no --> e431{"header block<br/>too large?"}
     e431 -- yes --> r431["431 Request Header Fields Too Large<br/>close"]
     e431 -- no --> e413{"body too large?"}
     e413 -- yes --> r413["413 Content Too Large<br/>close"]
@@ -161,7 +160,7 @@ flowchart TD
     e400 -- no --> done{"message<br/>complete?"}
     done -- "no (EOF)" --> endc(["close, nothing to send"])
     done -- yes --> stream{"streaming route<br/>matched during parsing?"}
-    stream -- yes --> shandler["handler already received the body chunks<br/>no middleware chain<br/>engine sends 200 OK unless the handler took over"]
+    stream -- yes --> shandler["middleware chain ran before the first chunk<br/>handler already received the body chunks<br/>engine sends 200 OK unless the handler took over"]
     stream -- no --> method{"method supported?"}
     method -- no --> r501["501 Not Implemented"]
     method -- yes --> find{"RouteTable.find"}
@@ -177,9 +176,13 @@ Notes:
 - `400`, `413`, `431`, `404`, `405` and `501` are produced by the engine. The
   middleware chain does not run for them, so headers added by middleware (for
   example `security_headers`) are absent from these replies.
-- **Streaming routes skip the middleware chain.** The handler is called while the
-  body is still being parsed. Authentication for such a route (for example OTA
-  upload) must be done inside the handler. See
+- **Streaming routes run the middleware chain before the first body chunk.** The
+  streaming handler is called while the body is still being parsed, so the engine
+  runs the chain as soon as the headers are complete, with a no-op as its final
+  target. If a middleware does not call `next()` (for example `api_key_auth`
+  answering `401`), the parser is stopped, no byte of the body reaches the
+  handler, and the engine sends the middleware's response and closes the
+  connection. See
   [Streaming body / OTA](../usage/iot.md#streaming-body--ota-firmware-upload).
 - Literal routes are matched before `{name}` patterns. `path_exists` is what
   separates `405` from `404`.

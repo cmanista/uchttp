@@ -30,7 +30,7 @@ socket abstraction.
 | **Reliability** | Fixed connection pool, keep-alive and idle timeouts, graceful shutdown |
 | **Configurable** | Every limit is a compile-time macro; Kconfig symbols on Zephyr |
 | **Portability** | The core (`include/uchttp*.h`, `src/uchttp*.cpp`) has no OS or POSIX dependencies; ports for Linux and Zephyr (module with Kconfig, tested on `native_sim` and NXP FRDM-RW612), a short contract for other targets |
-| **Tested** | 215 unit tests run on the host against in-memory sockets; CI builds with GCC and Clang |
+| **Tested** | 222 unit tests run on the host against in-memory sockets; CI builds with GCC and Clang |
 
 ## Quick start (Linux)
 

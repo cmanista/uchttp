@@ -42,8 +42,8 @@ uchttp::security::set_bearer_token("tok-123");
 server.use(uchttp::security::bearer_auth);      // Authorization: Bearer <token>
 ```
 
-`secure_compare(a, b)` is also available for your own secrets (for example in a
-streaming handler, which the middleware chain does not cover):
+`secure_compare(a, b)` is also available for your own secrets, for example in a
+handler or in your own middleware:
 
 ```cpp
 if (!uchttp::security::secure_compare(req.get_header("X-API-Key"), "s3cr3t")) {
